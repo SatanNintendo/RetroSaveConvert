@@ -25,7 +25,6 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <shobjidl.h>
 #include <uxtheme.h>
 
 #include <algorithm>
@@ -746,140 +745,44 @@ static void ApplyLanguage(rsc::Lang lang, bool saveIni) {
 // ========================================================================================
 // File pickers
 // ========================================================================================
-// Use the native Vista+ Explorer dialogs first. Besides being more consistent with
-// current Windows versions, these dialogs use the COM file-dialog path rather than
-// relying on a legacy common-dialog hook/state that can interact badly with the
-// application's owner-drawn controls. Keep the Win32 dialogs as a fallback for
-// systems where COM dialog creation is unavailable.
-static HRESULT ShowOpenFileDialogCom(HWND owner, const wchar_t* title,
-                                     const wchar_t* filter, bool pickFolder,
-                                     std::wstring& selected) {
-    selected.clear();
-    IFileOpenDialog* dialog = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(&dialog));
-    if (FAILED(hr) || !dialog) return FAILED(hr) ? hr : E_FAIL;
-
-    DWORD options = 0;
-    hr = dialog->GetOptions(&options);
-    if (SUCCEEDED(hr)) {
-        options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
-        if (pickFolder) options |= FOS_PICKFOLDERS;
-        else options |= FOS_FILEMUSTEXIST;
-        hr = dialog->SetOptions(options);
-    }
-    if (SUCCEEDED(hr) && title && *title) hr = dialog->SetTitle(title);
-
-    std::vector<COMDLG_FILTERSPEC> specs;
-    if (SUCCEEDED(hr) && !pickFolder && filter) {
-        // OPENFILENAME and IFileDialog both accept pairs of description/pattern
-        // strings, but in different representations. Parse the existing static
-        // double-NUL-terminated resource string so both pickers show identical filters.
-        const wchar_t* cursor = filter;
-        while (*cursor) {
-            const wchar_t* description = cursor;
-            cursor += lstrlenW(cursor) + 1;
-            if (!*cursor) break;
-            const wchar_t* pattern = cursor;
-            cursor += lstrlenW(cursor) + 1;
-            specs.push_back({description, pattern});
-        }
-        if (!specs.empty()) {
-            hr = dialog->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
-            if (SUCCEEDED(hr)) hr = dialog->SetFileTypeIndex(1);
-        }
-    }
-
-    if (SUCCEEDED(hr)) hr = dialog->Show(owner);
-    if (SUCCEEDED(hr)) {
-        IShellItem* item = nullptr;
-        hr = dialog->GetResult(&item);
-        if (SUCCEEDED(hr) && item) {
-            PWSTR path = nullptr;
-            hr = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
-            if (SUCCEEDED(hr) && path) selected.assign(path);
-            if (path) CoTaskMemFree(path);
-            item->Release();
-            if (SUCCEEDED(hr) && selected.empty()) hr = E_FAIL;
-        } else if (item) {
-            item->Release();
-        }
-    }
-
-    dialog->Release();
-    return hr;
-}
-
-static void ShowPickerError(HWND owner, bool folder, unsigned long errorCode) {
-    wchar_t message[256] = {};
-    if (g_lang == LANG_RU) {
-        wsprintfW(message, folder
-            ? L"Не удалось открыть окно выбора папки (код 0x%08lX)."
-            : L"Не удалось открыть окно выбора файла (код 0x%08lX).", errorCode);
-    } else {
-        wsprintfW(message, folder
-            ? L"Could not open the folder picker (error 0x%08lX)."
-            : L"Could not open the file picker (error 0x%08lX).", errorCode);
-    }
-    MessageBoxW(owner, message, Str(S_AppTitle, g_lang), MB_OK | MB_ICONWARNING);
-}
-
+// Keep file selection on the standard Win32 dialog APIs. They run with the
+// existing main-window message loop and do not require a second COM modal UI path.
+// Do not force a full parent/child redraw when the modal dialog closes: native
+// ComboBox list windows and the app's owner-drawn buttons repaint themselves.
 static std::wstring PickOpenFile(HWND owner, const wchar_t* title, const wchar_t* filter) {
-    std::wstring selected;
-    const HRESULT hr = ShowOpenFileDialogCom(owner, title, filter, false, selected);
-    if (SUCCEEDED(hr) && !selected.empty()) {
-        RefreshWindowPainting(owner);
-        return selected;
-    }
-    // S_FALSE is not a cancellation code here; the standard cancellation result
-    // is HRESULT_FROM_WIN32(ERROR_CANCELLED). Do not show a second dialog after
-    // the user intentionally pressed Cancel.
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-        RefreshWindowPainting(owner);
-        return std::wstring();
-    }
-
-    // Fallback for unusual Windows installations where IFileOpenDialog cannot be
-    // created. Keep this structure local and fully initialized for the legacy API.
-    wchar_t buf[1024] = {};
+    std::vector<wchar_t> buffer(32768, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = filter;
-    ofn.lpstrFile = buf;
-    ofn.nMaxFile = static_cast<DWORD>(std::size(buf));
+    ofn.lpstrFile = buffer.data();
+    ofn.nMaxFile = static_cast<DWORD>(buffer.size());
     ofn.lpstrTitle = title;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY |
                 OFN_EXPLORER | OFN_NOCHANGEDIR;
     ofn.nFilterIndex = 1;
-    if (GetOpenFileNameW(&ofn)) selected = buf;
-    else {
-        const DWORD dialogError = CommDlgExtendedError();
-        if (dialogError != 0) ShowPickerError(owner, false, dialogError);
+
+    if (GetOpenFileNameW(&ofn)) return std::wstring(buffer.data());
+    const DWORD error = CommDlgExtendedError();
+    if (error != 0) {
+        wchar_t message[192] = {};
+        if (g_lang == LANG_RU) {
+            wsprintfW(message, L"Не удалось открыть диалог выбора файла (код 0x%08lX).", error);
+        } else {
+            wsprintfW(message, L"Could not open the file picker (error 0x%08lX).", error);
+        }
+        MessageBoxW(owner, message, Str(S_AppTitle, g_lang), MB_OK | MB_ICONWARNING);
     }
-    RefreshWindowPainting(owner);
-    return selected;
+    return std::wstring(); // Cancel is normal; leave the form untouched.
 }
 
 static std::wstring PickFolder(HWND owner, const wchar_t* title) {
-    std::wstring result;
-    const HRESULT hr = ShowOpenFileDialogCom(owner, title, nullptr, true, result);
-    if (SUCCEEDED(hr) && !result.empty()) {
-        if (result.back() != L'\\' && result.back() != L'/') result += L'\\';
-        RefreshWindowPainting(owner);
-        return result;
-    }
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-        RefreshWindowPainting(owner);
-        return std::wstring();
-    }
-
-    // Legacy folder-browser fallback. SHBrowseForFolder returns null for both
-    // Cancel and shell errors, so only the COM path is reported as a hard failure.
     BROWSEINFOW bi = {};
     bi.hwndOwner = owner;
     bi.lpszTitle = title;
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+
+    std::wstring result;
     LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
     if (pidl) {
         wchar_t path[MAX_PATH + 1] = {};
@@ -888,7 +791,6 @@ static std::wstring PickFolder(HWND owner, const wchar_t* title) {
     }
     if (!result.empty() && result.back() != L'\\' && result.back() != L'/')
         result += L'\\';
-    RefreshWindowPainting(owner);
     return result;
 }
 
@@ -923,6 +825,7 @@ static void TryAutoRom(const std::wstring& savePath) {
         LogLine(rsc::Expand(Str(S_DroppedRom, g_lang), {guess}));
     }
 }
+
 
 // ========================================================================================
 // Conversion
@@ -1050,6 +953,41 @@ static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
         return 1;
     }
     return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// The main window deliberately does not use WS_CLIPCHILDREN because transparent
+// STATIC labels need the parent background underneath them. However, background
+// erasure must not be allowed to paint over opaque native controls (ComboBox/Edit)
+// or owner-drawn controls. Clip only those rectangles while erasing the parent.
+// This avoids stale/vanishing controls without preventing transparent labels from
+// showing the themed background.
+static void ExcludeChildRect(HDC dc, HWND parent, HWND child) {
+    if (!dc || !parent || !child || !IsWindowVisible(child)) return;
+    RECT childRect = {};
+    if (!GetWindowRect(child, &childRect)) return;
+    POINT points[2] = {{childRect.left, childRect.top},
+                       {childRect.right, childRect.bottom}};
+    MapWindowPoints(nullptr, parent, points, 2);
+    ExcludeClipRect(dc, points[0].x, points[0].y, points[1].x, points[1].y);
+}
+
+static void EraseMainBackground(HWND hwnd, HDC dc) {
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    const int saved = SaveDC(dc);
+    if (saved == 0) {
+        FillRect(dc, &client, ThemeWindowBrush());
+        return;
+    }
+    const HWND opaqueChildren[] = {
+        g_tabs, g_grpSource, g_grpTarget, g_grpOptions,
+        g_srcEmu, g_type, g_tgtEmu,
+        g_srcFile, g_romFile, g_outDir, g_log,
+        g_btnSrcBrowse, g_btnRomBrowse, g_btnOutDirBrowse, g_convert
+    };
+    for (HWND child : opaqueChildren) ExcludeChildRect(dc, hwnd, child);
+    FillRect(dc, &client, ThemeWindowBrush());
+    RestoreDC(dc, saved);
 }
 
 // ========================================================================================
@@ -1182,9 +1120,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_ERASEBKGND: {
-            RECT rc = {};
-            GetClientRect(hwnd, &rc);
-            FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeWindowBrush());
+            EraseMainBackground(hwnd, reinterpret_cast<HDC>(wParam));
             return 1;
         }
 
@@ -1366,8 +1302,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             const int id = LOWORD(wParam);
             const int code = HIWORD(wParam);
             switch (id) {
+                case IDC_SRC_EMU:
+                    if (reinterpret_cast<HWND>(lParam) == g_srcEmu &&
+                        (code == CBN_SELCHANGE || code == CBN_SELENDOK ||
+                         code == CBN_SELENDCANCEL)) return 0;
+                    break;
+                case IDC_TYPE:
+                    if (reinterpret_cast<HWND>(lParam) == g_type &&
+                        (code == CBN_SELCHANGE || code == CBN_SELENDOK ||
+                         code == CBN_SELENDCANCEL)) return 0;
+                    break;
+                case IDC_TGT_EMU:
+                    if (reinterpret_cast<HWND>(lParam) == g_tgtEmu &&
+                        (code == CBN_SELCHANGE || code == CBN_SELENDOK ||
+                         code == CBN_SELENDCANCEL)) return 0;
+                    break;
                 case IDC_SRC_BROWSE: {
-                    if (code != BN_CLICKED) return 0;
+                    if (reinterpret_cast<HWND>(lParam) != g_btnSrcBrowse || code != BN_CLICKED)
+                        break;
                     std::wstring p = PickOpenFile(g_main, Str(S_PickSaveTitle, g_lang),
                                                   Str(S_SaveFilter, g_lang));
                     if (!p.empty()) {
@@ -1378,14 +1330,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return 0;
                 }
                 case IDC_ROM_BROWSE: {
-                    if (code != BN_CLICKED) return 0;
+                    if (reinterpret_cast<HWND>(lParam) != g_btnRomBrowse || code != BN_CLICKED)
+                        break;
                     std::wstring p = PickOpenFile(g_main, Str(S_PickRomTitle, g_lang),
                                                   Str(S_RomFilter, g_lang));
                     if (!p.empty()) SetWindowTextW(g_romFile, p.c_str());
                     return 0;
                 }
                 case IDC_OUTDIR_BROWSE: {
-                    if (code != BN_CLICKED) return 0;
+                    if (reinterpret_cast<HWND>(lParam) != g_btnOutDirBrowse || code != BN_CLICKED)
+                        break;
                     std::wstring p = PickFolder(g_main, Str(S_PickFolderTitle, g_lang));
                     if (!p.empty()) SetWindowTextW(g_outDir, p.c_str());
                     return 0;
@@ -1418,7 +1372,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 default:
                     break;
             }
-            return 0;
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         }
 
         case WM_DESTROY:
@@ -1462,9 +1416,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     icc.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
     if (!InitCommonControlsEx(&icc)) return 1;
 
-    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const bool comInitialized = SUCCEEDED(comResult);
-
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -1481,7 +1432,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassExW(&wc)) {
         if (wc.hIconSm) DestroyIcon(wc.hIconSm);
-        if (comInitialized) CoUninitialize();
         return 1;
     }
 
@@ -1513,7 +1463,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (!g_main) {
         UnregisterClassW(wc.lpszClassName, hInstance);
         if (wc.hIconSm) DestroyIcon(wc.hIconSm);
-        if (comInitialized) CoUninitialize();
         return 1;
     }
 
@@ -1547,6 +1496,5 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     const int exitCode = (messageResult == -1) ? 1 : static_cast<int>(msg.wParam);
     UnregisterClassW(wc.lpszClassName, hInstance);
     if (wc.hIconSm) DestroyIcon(wc.hIconSm);
-    if (comInitialized) CoUninitialize();
     return exitCode;
 }
