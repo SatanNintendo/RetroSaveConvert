@@ -33,3 +33,5 @@
 #define IDM_LANG_EN             40001
 #define IDM_LANG_RU             40002   // must be IDM_LANG_EN + 1
 #define IDM_ABOUT               40003
+#define IDM_THEME_LIGHT         40004
+#define IDM_THEME_DARK          40005

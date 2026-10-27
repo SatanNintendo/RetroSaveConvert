@@ -25,6 +25,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <cwctype>
@@ -48,6 +49,7 @@ static HWND        g_placeholder = nullptr;   // SNES/N64 "coming soon" label
 static HFONT       g_font    = nullptr;
 static HMENU       g_menuBar = nullptr;
 static HMENU       g_menuLanguage = nullptr;
+static HMENU       g_menuView = nullptr;
 static HMENU       g_menuHelp = nullptr;
 
 static HWND g_grpSource, g_grpTarget, g_grpOptions;
@@ -60,7 +62,35 @@ static HWND g_lblOutDir, g_outDir, g_btnOutDirBrowse, g_lblOutDirHint;
 static HWND g_backup, g_convert, g_lblLog, g_log;
 
 static rsc::Lang g_lang = rsc::LANG_EN;
+static bool      g_darkTheme = false;
+static HBRUSH    g_brushWindow = nullptr;
+static HBRUSH    g_brushSurface = nullptr;
+static HBRUSH    g_brushEdit = nullptr;
 static float     g_scale = 1.0f;
+
+static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                         LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
+
+static COLORREF ThemeWindowColor() { return g_darkTheme ? RGB(30, 32, 35) : GetSysColor(COLOR_BTNFACE); }
+static COLORREF ThemeSurfaceColor() { return g_darkTheme ? RGB(40, 43, 47) : GetSysColor(COLOR_BTNFACE); }
+static COLORREF ThemeEditColor() { return g_darkTheme ? RGB(24, 26, 29) : GetSysColor(COLOR_WINDOW); }
+static COLORREF ThemeTextColor() { return g_darkTheme ? RGB(232, 234, 237) : GetSysColor(COLOR_WINDOWTEXT); }
+static COLORREF ThemeMutedTextColor() { return g_darkTheme ? RGB(190, 194, 200) : GetSysColor(COLOR_GRAYTEXT); }
+
+static void RecreateThemeBrushes() {
+    if (g_brushWindow) { DeleteObject(g_brushWindow); g_brushWindow = nullptr; }
+    if (g_brushSurface) { DeleteObject(g_brushSurface); g_brushSurface = nullptr; }
+    if (g_brushEdit) { DeleteObject(g_brushEdit); g_brushEdit = nullptr; }
+    if (g_darkTheme) {
+        g_brushWindow = CreateSolidBrush(ThemeWindowColor());
+        g_brushSurface = CreateSolidBrush(ThemeSurfaceColor());
+        g_brushEdit = CreateSolidBrush(ThemeEditColor());
+    }
+}
+
+static HBRUSH ThemeWindowBrush() { return g_darkTheme && g_brushWindow ? g_brushWindow : GetSysColorBrush(COLOR_BTNFACE); }
+static HBRUSH ThemeSurfaceBrush() { return g_darkTheme && g_brushSurface ? g_brushSurface : GetSysColorBrush(COLOR_BTNFACE); }
+static HBRUSH ThemeEditBrush() { return g_darkTheme && g_brushEdit ? g_brushEdit : GetSysColorBrush(COLOR_WINDOW); }
 
 static int SX(int x) { return static_cast<int>(x * g_scale + 0.5f); }
 
@@ -236,39 +266,50 @@ static std::wstring UserConfigIniW() {
     return ExeDirW() + L"RetroSaveConverter.ini";
 }
 
-static bool ReadLangIniValue(const std::wstring& ini, wchar_t* value, DWORD valueCount) {
-    return GetPrivateProfileStringW(L"Settings", L"Language", L"", value,
-                                    valueCount, ini.c_str()) != 0;
+static bool ReadIniValue(const std::wstring& ini, const wchar_t* key, wchar_t* value,
+                         DWORD valueCount) {
+    return GetPrivateProfileStringW(L"Settings", key, L"", value, valueCount,
+                                    ini.c_str()) != 0;
+}
+
+static bool ReadSettingValue(const wchar_t* key, wchar_t* value, DWORD valueCount) {
+    const std::wstring portableIni = ExeDirW() + L"RetroSaveConverter.ini";
+    if (ReadIniValue(portableIni, key, value, valueCount)) return true;
+    const std::wstring userIni = UserConfigIniW();
+    return userIni != portableIni && ReadIniValue(userIni, key, value, valueCount);
+}
+
+static void SaveSettingValue(const wchar_t* key, const wchar_t* value) {
+    const std::wstring portableIni = ExeDirW() + L"RetroSaveConverter.ini";
+    if (WritePrivateProfileStringW(L"Settings", key, value, portableIni.c_str())) return;
+    const std::wstring userIni = UserConfigIniW();
+    if (userIni != portableIni)
+        WritePrivateProfileStringW(L"Settings", key, value, userIni.c_str());
 }
 
 static void SaveLangIni() {
-    const wchar_t* value = (g_lang == rsc::LANG_RU) ? L"ru" : L"en";
-    const std::wstring portableIni = ExeDirW() + L"RetroSaveConverter.ini";
-    if (WritePrivateProfileStringW(L"Settings", L"Language", value,
-                                   portableIni.c_str()))
-        return;
-
-    const std::wstring userIni = UserConfigIniW();
-    if (userIni != portableIni) {
-        WritePrivateProfileStringW(L"Settings", L"Language", value, userIni.c_str());
-    }
+    SaveSettingValue(L"Language", (g_lang == rsc::LANG_RU) ? L"ru" : L"en");
 }
 
 static void LoadLangIni() {
     wchar_t value[16] = {};
-    const std::wstring portableIni = ExeDirW() + L"RetroSaveConverter.ini";
-    bool found = ReadLangIniValue(portableIni, value,
-                                  static_cast<DWORD>(std::size(value)));
-    if (!found) {
-        const std::wstring userIni = UserConfigIniW();
-        if (userIni != portableIni) {
-            found = ReadLangIniValue(userIni, value,
-                                     static_cast<DWORD>(std::size(value)));
-        }
-    }
+    const bool found = ReadSettingValue(L"Language", value,
+                                        static_cast<DWORD>(std::size(value)));
     const std::wstring saved = found ? ToLowerW(value) : L"en";
     // Accept textual values and legacy numeric values from older INI files.
     g_lang = (saved == L"ru" || saved == L"1") ? rsc::LANG_RU : rsc::LANG_EN;
+}
+
+static void SaveThemeIni() {
+    SaveSettingValue(L"DarkTheme", g_darkTheme ? L"1" : L"0");
+}
+
+static void LoadThemeIni() {
+    wchar_t value[16] = {};
+    const bool found = ReadSettingValue(L"DarkTheme", value,
+                                        static_cast<DWORD>(std::size(value)));
+    const std::wstring saved = found ? ToLowerW(value) : L"0";
+    g_darkTheme = (saved == L"1" || saved == L"true" || saved == L"dark");
 }
 
 // ========================================================================================
@@ -281,10 +322,21 @@ static HWND MkStatic(HWND parent, int id, DWORD style, int x, int y, int w, int 
 }
 
 static HWND MkButton(HWND parent, int id, DWORD style, int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | style,
+    // Owner-draw push buttons so their fill/text colours remain coherent in both
+    // themes. Group boxes and check boxes keep native styles.
+    const DWORD type = style & BS_TYPEMASK;
+    if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON)
+        style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW;
+    const DWORD tabStop = ((style & BS_TYPEMASK) == BS_GROUPBOX) ? 0 : WS_TABSTOP;
+    return CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | tabStop | style,
                            x, y, w, h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
                            nullptr);
+}
+
+static bool IsOwnerDrawPushButton(HWND control) {
+    return control && (control == g_btnSrcBrowse || control == g_btnRomBrowse ||
+                       control == g_btnOutDirBrowse || control == g_convert);
 }
 
 static HWND MkEdit(HWND parent, int id, int x, int y, int w, int h) {
@@ -444,24 +496,25 @@ static bool SetMenuLabel(HMENU menu, UINT item, bool byPosition, const wchar_t* 
 
 static bool EnsureMainMenu() {
     if (!g_main || !IsWindow(g_main)) return false;
-    if (g_menuBar && GetMenu(g_main) == g_menuBar && g_menuLanguage && g_menuHelp)
+    if (g_menuBar && GetMenu(g_main) == g_menuBar && g_menuLanguage && g_menuView && g_menuHelp)
         return true;
 
-    // This program has only one top-level window. If it no longer owns the
-    // cached menu, release the stale menu hierarchy before replacing it.
     if (g_menuBar) {
-        DestroyMenu(g_menuBar); // destroys any attached popup menus as well
+        DestroyMenu(g_menuBar);
         g_menuBar = nullptr;
         g_menuLanguage = nullptr;
+        g_menuView = nullptr;
         g_menuHelp = nullptr;
     }
 
     HMENU bar = CreateMenu();
     HMENU language = CreatePopupMenu();
+    HMENU view = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
-    if (!bar || !language || !help) {
+    if (!bar || !language || !view || !help) {
         if (bar) DestroyMenu(bar);
         if (language) DestroyMenu(language);
+        if (view) DestroyMenu(view);
         if (help) DestroyMenu(help);
         return false;
     }
@@ -469,34 +522,32 @@ static bool EnsureMainMenu() {
     const bool languageItemsOk =
         AppendMenuW(language, MF_STRING, IDM_LANG_EN, L"English") != FALSE &&
         AppendMenuW(language, MF_STRING, IDM_LANG_RU, L"Русский") != FALSE;
-    const bool helpItemsOk =
-        AppendMenuW(help, MF_STRING, IDM_ABOUT, L"About") != FALSE;
+    const bool viewItemsOk =
+        AppendMenuW(view, MF_STRING, IDM_THEME_LIGHT, L"Light theme") != FALSE &&
+        AppendMenuW(view, MF_STRING, IDM_THEME_DARK, L"Dark theme") != FALSE;
+    const bool helpItemsOk = AppendMenuW(help, MF_STRING, IDM_ABOUT, L"About") != FALSE;
 
-    bool languageAttached = false;
-    bool helpAttached = false;
-    if (languageItemsOk) {
-        languageAttached = AppendMenuW(bar, MF_POPUP,
-                                      reinterpret_cast<UINT_PTR>(language),
-                                      L"Language") != FALSE;
-    }
-    if (helpItemsOk) {
-        helpAttached = AppendMenuW(bar, MF_POPUP,
-                                  reinterpret_cast<UINT_PTR>(help),
-                                  L"Help") != FALSE;
-    }
+    bool languageAttached = false, viewAttached = false, helpAttached = false;
+    if (languageItemsOk)
+        languageAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(language),
+                                       L"Language") != FALSE;
+    if (viewItemsOk)
+        viewAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View") != FALSE;
+    if (helpItemsOk)
+        helpAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Help") != FALSE;
 
-    if (!languageItemsOk || !helpItemsOk || !languageAttached || !helpAttached ||
-        !SetMenu(g_main, bar)) {
-        // Destroying the bar frees submenus it acquired; separately free only
-        // popup handles that were never transferred to the bar.
-        DestroyMenu(bar);
-        if (language && !languageAttached) DestroyMenu(language);
-        if (help && !helpAttached) DestroyMenu(help);
+    if (!languageItemsOk || !viewItemsOk || !helpItemsOk || !languageAttached ||
+        !viewAttached || !helpAttached || !SetMenu(g_main, bar)) {
+        DestroyMenu(bar); // frees popup menus already attached to it
+        if (!languageAttached) DestroyMenu(language);
+        if (!viewAttached) DestroyMenu(view);
+        if (!helpAttached) DestroyMenu(help);
         return false;
     }
 
     g_menuBar = bar;
     g_menuLanguage = language;
+    g_menuView = view;
     g_menuHelp = help;
     return true;
 }
@@ -506,13 +557,18 @@ static bool UpdateMenuLanguage(rsc::Lang lang) {
 
     bool labelsOk = true;
     labelsOk &= SetMenuLabel(g_menuBar, 0, true, Str(S_MenuLanguage, lang));
-    labelsOk &= SetMenuLabel(g_menuBar, 1, true, Str(S_MenuHelp, lang));
+    labelsOk &= SetMenuLabel(g_menuBar, 1, true, Str(S_MenuView, lang));
+    labelsOk &= SetMenuLabel(g_menuBar, 2, true, Str(S_MenuHelp, lang));
     labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_EN, false, Str(S_MenuEnglish, lang));
     labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_RU, false, Str(S_MenuRussian, lang));
+    labelsOk &= SetMenuLabel(g_menuView, IDM_THEME_LIGHT, false, Str(S_MenuLightTheme, lang));
+    labelsOk &= SetMenuLabel(g_menuView, IDM_THEME_DARK, false, Str(S_MenuDarkTheme, lang));
     labelsOk &= SetMenuLabel(g_menuHelp, IDM_ABOUT, false, Str(S_MenuAbout, lang));
 
     CheckMenuRadioItem(g_menuLanguage, IDM_LANG_EN, IDM_LANG_RU,
                        IDM_LANG_EN + static_cast<int>(lang), MF_BYCOMMAND);
+    CheckMenuRadioItem(g_menuView, IDM_THEME_LIGHT, IDM_THEME_DARK,
+                       g_darkTheme ? IDM_THEME_DARK : IDM_THEME_LIGHT, MF_BYCOMMAND);
     DrawMenuBar(g_main);
     return labelsOk;
 }
@@ -520,10 +576,43 @@ static bool UpdateMenuLanguage(rsc::Lang lang) {
 static void DestroyMainMenu(HWND hwnd) {
     if (!g_menuBar) return;
     if (IsWindow(hwnd) && GetMenu(hwnd) == g_menuBar) SetMenu(hwnd, nullptr);
-    DestroyMenu(g_menuBar); // owns the attached language/help submenus
+    DestroyMenu(g_menuBar);
     g_menuBar = nullptr;
     g_menuLanguage = nullptr;
+    g_menuView = nullptr;
     g_menuHelp = nullptr;
+}
+
+static void RefreshWindowPainting(HWND hwnd) {
+    if (!IsWindow(hwnd)) return;
+    DrawMenuBar(hwnd);
+    RedrawWindow(hwnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+static void ApplyControlTheme(HWND control) {
+    if (!control || !IsWindow(control)) return;
+    // Classic Win32 controls honour WM_CTLCOLOR*, enabling a consistent fallback
+    // on Windows versions that do not expose a public dark-mode control API.
+    SetWindowTheme(control, g_darkTheme ? L"" : nullptr, g_darkTheme ? L"" : nullptr);
+    InvalidateRect(control, nullptr, TRUE);
+}
+
+static void ApplyTheme(bool dark, bool saveIni) {
+    g_darkTheme = dark;
+    RecreateThemeBrushes();
+
+    if (g_tabs) ApplyControlTheme(g_tabs);
+    for (HWND* control : kNesCtrls) if (*control) ApplyControlTheme(*control);
+    if (g_placeholder) ApplyControlTheme(g_placeholder);
+
+    if (g_menuView) {
+        CheckMenuRadioItem(g_menuView, IDM_THEME_LIGHT, IDM_THEME_DARK,
+                           g_darkTheme ? IDM_THEME_DARK : IDM_THEME_LIGHT, MF_BYCOMMAND);
+        if (g_main) DrawMenuBar(g_main);
+    }
+    if (saveIni) SaveThemeIni();
+    if (g_main) RefreshWindowPainting(g_main);
 }
 
 static void ApplyLanguage(rsc::Lang lang, bool saveIni) {
@@ -752,14 +841,15 @@ static void OnDropFiles(HDROP hd) {
     }
 }
 
-// ========================================================================================
-// Theme refresh
-// ========================================================================================
-static void RefreshWindowPainting(HWND hwnd) {
-    if (!IsWindow(hwnd)) return;
-    DrawMenuBar(hwnd);
-    RedrawWindow(hwnd, nullptr, nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                         LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_ERASEBKGND && g_darkTheme) {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeWindowBrush());
+        return 1;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 // ========================================================================================
@@ -792,14 +882,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             g_font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-            // tabs
+            // Tabs are owner-drawn so their background and captions can follow the
+            // selected theme instead of leaving a light strip in dark mode.
             g_tabs = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                      WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS |
-                                         TCS_TABS,
+                                         TCS_TABS | TCS_FIXEDWIDTH | TCS_OWNERDRAWFIXED,
                                      0, 0, cs->cx, cs->cy, hwnd,
                                      reinterpret_cast<HMENU>(
                                          static_cast<INT_PTR>(IDC_TABS)),
                                      g_hInst, nullptr);
+            if (g_tabs) {
+                TabCtrl_SetItemSize(g_tabs, SX(100), SX(26));
+                SetWindowSubclass(g_tabs, TabSubclassProc, 1, 0);
+            }
 
             const int lx = SX(140), lh = SX(26);
             // NES page controls (positions set in LayoutAll)
@@ -862,13 +957,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(g_placeholder, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
             LoadLangIni();
+            LoadThemeIni();
             ApplyLanguage(g_lang, false);
+            ApplyTheme(g_darkTheme, false);
             LayoutAll();
             ShowNesPage(true);
             ShowWindow(g_placeholder, SW_HIDE);
+            RedrawWindow(hwnd, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 
             DragAcceptFiles(hwnd, TRUE);
             return 0;
+        }
+
+        case WM_ERASEBKGND: {
+            if (!g_darkTheme) return DefWindowProcW(hwnd, msg, wParam, lParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeWindowBrush());
+            return 1;
+        }
+
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            HWND control = reinterpret_cast<HWND>(lParam);
+            if (!g_darkTheme) return DefWindowProcW(hwnd, msg, wParam, lParam);
+            SetTextColor(dc, ThemeTextColor());
+            if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+                SetBkMode(dc, OPAQUE);
+                SetBkColor(dc, ThemeEditColor());
+                return reinterpret_cast<INT_PTR>(ThemeEditBrush());
+            }
+            const bool muted = control == g_lblOutDirHint || control == g_lblLog;
+            SetTextColor(dc, muted ? ThemeMutedTextColor() : ThemeTextColor());
+            SetBkMode(dc, TRANSPARENT);
+            SetBkColor(dc, ThemeWindowColor());
+            return reinterpret_cast<INT_PTR>(ThemeWindowBrush());
         }
 
         case WM_THEMECHANGED:
@@ -891,6 +1018,95 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             mmi->ptMinTrackSize.x = SX(560);
             mmi->ptMinTrackSize.y = SX(560);
             return 0;
+        }
+
+        case WM_DRAWITEM: {
+            const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+            if (!dis) return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+            if (dis->hwndItem == g_tabs &&
+                dis->itemID < static_cast<UINT>(TabCtrl_GetItemCount(g_tabs))) {
+                const bool selected = (static_cast<int>(dis->itemID) == TabCtrl_GetCurSel(g_tabs));
+                HBRUSH fill = g_darkTheme
+                    ? (selected ? ThemeSurfaceBrush() : ThemeWindowBrush())
+                    : GetSysColorBrush(selected ? COLOR_WINDOW : COLOR_BTNFACE);
+                FillRect(dis->hDC, &dis->rcItem, fill);
+
+                wchar_t caption[128] = {};
+                TCITEMW ti = {};
+                ti.mask = TCIF_TEXT;
+                ti.pszText = caption;
+                ti.cchTextMax = static_cast<int>(std::size(caption));
+                TabCtrl_GetItem(g_tabs, static_cast<int>(dis->itemID), &ti);
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, ThemeTextColor());
+                RECT textRc = dis->rcItem;
+                InflateRect(&textRc, -SX(4), -SX(1));
+                DrawTextW(dis->hDC, caption, -1, &textRc,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                if (g_darkTheme) {
+                    HBRUSH border = CreateSolidBrush(RGB(70, 74, 80));
+                    if (border) { FrameRect(dis->hDC, &dis->rcItem, border); DeleteObject(border); }
+                } else {
+                    DrawEdge(dis->hDC, const_cast<RECT*>(&dis->rcItem),
+                             selected ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
+                }
+                return TRUE;
+            }
+
+            if (dis->CtlType == ODT_BUTTON && IsOwnerDrawPushButton(dis->hwndItem)) {
+                const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+                const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+                const bool focused = (dis->itemState & ODS_FOCUS) != 0;
+                RECT rc = dis->rcItem;
+                HBRUSH fill = g_darkTheme
+                    ? ThemeSurfaceBrush()
+                    : GetSysColorBrush(COLOR_BTNFACE);
+                FillRect(dis->hDC, &rc, fill);
+
+                if (g_darkTheme) {
+                    HBRUSH border = CreateSolidBrush(pressed ? RGB(100, 105, 112)
+                                                              : RGB(76, 81, 88));
+                    if (border) { FrameRect(dis->hDC, &rc, border); DeleteObject(border); }
+                    if (dis->hwndItem == g_convert && !pressed) {
+                        RECT defaultRc = rc;
+                        InflateRect(&defaultRc, -2, -2);
+                        HBRUSH accent = CreateSolidBrush(RGB(82, 117, 151));
+                        if (accent) { FrameRect(dis->hDC, &defaultRc, accent); DeleteObject(accent); }
+                    }
+                    if (pressed) {
+                        HBRUSH pressedFill = CreateSolidBrush(RGB(53, 57, 62));
+                        if (pressedFill) {
+                            InflateRect(&rc, -1, -1);
+                            FillRect(dis->hDC, &rc, pressedFill);
+                            DeleteObject(pressedFill);
+                        }
+                    }
+                } else {
+                    DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+                    if (dis->hwndItem == g_convert && !pressed) {
+                        RECT defaultRc = rc;
+                        InflateRect(&defaultRc, -2, -2);
+                        DrawEdge(dis->hDC, &defaultRc, EDGE_BUMP, BF_RECT);
+                    }
+                }
+
+                wchar_t caption[128] = {};
+                GetWindowTextW(dis->hwndItem, caption, static_cast<int>(std::size(caption)));
+                RECT textRc = dis->rcItem;
+                InflateRect(&textRc, -SX(6), -SX(3));
+                if (pressed) OffsetRect(&textRc, SX(1), SX(1));
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, disabled ? ThemeMutedTextColor() : ThemeTextColor());
+                DrawTextW(dis->hDC, caption, -1, &textRc,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                if (focused) {
+                    InflateRect(&textRc, -SX(2), -SX(1));
+                    DrawFocusRect(dis->hDC, &textRc);
+                }
+                return TRUE;
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         }
 
         case WM_NOTIFY: {
@@ -950,6 +1166,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 case IDM_LANG_RU:
                     ApplyLanguage(rsc::LANG_RU, true);
                     return 0;
+                case IDM_THEME_LIGHT:
+                    ApplyTheme(false, true);
+                    return 0;
+                case IDM_THEME_DARK:
+                    ApplyTheme(true, true);
+                    return 0;
                 case IDM_ABOUT:
                     MessageBoxW(g_main, Str(S_AboutText, g_lang), Str(S_AppTitle, g_lang),
                                 MB_OK | MB_ICONINFORMATION);
@@ -971,6 +1193,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DeleteObject(g_font);
                 g_font = nullptr;
             }
+            if (g_brushWindow) { DeleteObject(g_brushWindow); g_brushWindow = nullptr; }
+            if (g_brushSurface) { DeleteObject(g_brushSurface); g_brushSurface = nullptr; }
+            if (g_brushEdit) { DeleteObject(g_brushEdit); g_brushEdit = nullptr; }
             if (g_main == hwnd) g_main = nullptr;
             return result;
         }
@@ -978,6 +1203,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
+}
+
+static bool IsComboDropDownOpen() {
+    return (g_srcEmu && SendMessageW(g_srcEmu, CB_GETDROPPEDSTATE, 0, 0)) ||
+           (g_type && SendMessageW(g_type, CB_GETDROPPEDSTATE, 0, 0)) ||
+           (g_tgtEmu && SendMessageW(g_tgtEmu, CB_GETDROPPEDSTATE, 0, 0));
 }
 
 // ========================================================================================
@@ -1042,14 +1273,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     ShowWindow(g_main, nCmdShow);
     UpdateWindow(g_main);
+    // UpdateWindow paints only the top-level client area. Force a synchronous
+    // invalidation/paint of child controls too, so combo captions and labels are
+    // visible immediately rather than only after the first mouse movement.
+    RefreshWindowPainting(g_main);
 
     MSG msg = {};
     BOOL messageResult = 0;
     while ((messageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
-        if (!IsDialogMessageW(g_main, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        if (IsDialogMessageW(g_main, &msg)) continue;
+
+        // Owner-drawn buttons no longer carry the BS_DEFPUSHBUTTON type flag.
+        // Preserve the app's existing Enter-to-convert behaviour when a combo's
+        // dropdown is not open; leave keyboard navigation and menu activation to
+        // IsDialogMessage above.
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN &&
+            !IsComboDropDownOpen() && GetFocus() != g_btnSrcBrowse &&
+            GetFocus() != g_btnRomBrowse && GetFocus() != g_btnOutDirBrowse) {
+            SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(IDC_CONVERT, BN_CLICKED), 0);
+            continue;
         }
+
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
     const int exitCode = (messageResult == -1) ? 1 : static_cast<int>(msg.wParam);

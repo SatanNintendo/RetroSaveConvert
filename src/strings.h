@@ -22,7 +22,8 @@ enum StrId {
     S_SrcEmu, S_SaveFile, S_Browse, S_RomFile, S_ContentType,
     S_TargetEmu, S_OutDir, S_OutDirHint, S_Backup, S_Convert, S_Log,
     S_ComingSoonSnes, S_ComingSoonN64,
-    S_MenuLanguage, S_MenuEnglish, S_MenuRussian, S_MenuAbout, S_MenuHelp,
+    S_MenuLanguage, S_MenuView, S_MenuLightTheme, S_MenuDarkTheme,
+    S_MenuEnglish, S_MenuRussian, S_MenuAbout, S_MenuHelp,
     S_AutoDetect, S_TypeSram, S_Type24C01, S_Type24C02, S_TypeDatach,
     S_GenericSav,
     S_PickSaveTitle, S_PickRomTitle, S_PickFolderTitle,
@@ -49,7 +50,8 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Back up replaced files (.bak)", L"Convert", L"Log:",
             L"SNES/SFC save conversion will be added in a future version.",
             L"N64 save conversion will be added in a future version.",
-            L"&Language", L"&English", L"&Russian", L"&About...", L"&Help",
+            L"&Language", L"&View", L"&Light theme", L"&Dark theme",
+            L"&English", L"&Russian", L"&About...", L"&Help",
             L"Auto-detect",
             L"Battery SRAM (regular save)",
             L"EEPROM 24C01 — 128 bytes",
@@ -77,7 +79,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"ROM file set: %1",
             L"Unsupported file type: %1",
             L"INFO", L"WARNING", L"ERROR",
-            L"Retro Save Converter 1.0.1\n\n"
+            L"Retro Save Converter 1.0\n\n"
             L"Converts in-game battery saves (NOT save states) between NES emulators:\n"
             L"MesenCE, Nestopia and Nintendulator.\n\n"
             L"Based on the save-format research of each emulator's source code.\n"
@@ -94,7 +96,8 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Создавать резервные копии (.bak)", L"Конвертировать", L"Журнал:",
             L"Конвертер сохранений SNES/SFC появится в следующей версии.",
             L"Конвертер сохранений N64 появится в следующей версии.",
-            L"&Язык", L"&Английский", L"&Русский", L"&О программе...", L"&Справка",
+            L"&Язык", L"&Вид", L"Светлая тема", L"Тёмная тема",
+            L"&Английский", L"&Русский", L"&О программе...", L"&Справка",
             L"Автоопределение",
             L"Батарейный SRAM (обычное сохранение)",
             L"EEPROM 24C01 — 128 байт",
@@ -122,7 +125,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Файл ROM выбран: %1",
             L"Неподдерживаемый тип файла: %1",
             L"ИНФО", L"ВНИМАНИЕ", L"ОШИБКА",
-            L"Конвертер сохранений Retro 1.0.1\n\n"
+            L"Конвертер сохранений Retro 1.0\n\n"
             L"Конвертирует игровые сохранения (НЕ сейв-стейты) между эмуляторами NES:\n"
             L"MesenCE, Nestopia и Nintendulator.\n\n"
             L"Форматы сохранений изучены по исходному коду каждого эмулятора.\n"

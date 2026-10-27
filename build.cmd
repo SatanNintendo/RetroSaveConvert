@@ -44,7 +44,7 @@ g++ -std=c++17 -O2 -Wall -Wextra ^
     -static -static-libgcc -static-libstdc++ ^
     src\main.cpp src\converter.cpp build\app.res ^
     -o %OUTPUT% ^
-    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -ladvapi32 -luxtheme
+    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luxtheme
 if errorlevel 1 goto fail
 
 echo [3/3] done.
@@ -63,7 +63,7 @@ cl /nologo /utf-8 /EHsc /O2 /W4 /MT ^
    /DUNICODE /D_UNICODE /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_WIN32_IE=0x0600 ^
    src\main.cpp src\converter.cpp build\app.res ^
    /Fe:%OUTPUT% ^
-   /link /subsystem:windows user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib advapi32.lib uxtheme.lib
+   /link /subsystem:windows user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uxtheme.lib
 if errorlevel 1 goto fail
 
 del /q build\*.obj >nul 2>nul
