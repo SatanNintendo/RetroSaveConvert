@@ -31,7 +31,10 @@ enum class Emu {
     MesenCE,
     Nestopia,
     Nintendulator,
-    Raw            // generic .sav
+    Raw,           // generic .sav
+    FCEUX,         // raw battery buffer(s) in <rom>.sav
+    PuNES,         // raw NVRAM buffer(s) in <rom>.prb
+    Ares           // NES save files inside ares' per-game .pak directory
 };
 
 // ---------------------------------------------------------------------------------------
@@ -55,7 +58,8 @@ struct RomInfo {
     int         mapper = -1;
     int         subMapper = -1;
     bool        battery = false;
-    uint32_t    batteryRamSize = 0;   // bytes; NES 2.0 only, 0 = unspecified
+    uint32_t    batteryRamSize = 0;   // PRG NVRAM bytes; NES 2.0 only, 0 = none/unspecified
+    uint32_t    chrBatteryRamSize = 0; // CHR NVRAM bytes; NES 2.0 only
 
     bool Parse(const uint8_t* data, size_t size);  // false if not an iNES file
 };
@@ -94,6 +98,10 @@ enum class Msg {
     ErrDatachUnsupported,   // target Nintendulator
     ErrReadFile,        // p1=name
     ErrWriteFile,       // p1=name
+    ErrDatachUnsupportedByTarget, // p1=target emulator
+    WarnAresRamUnused,            // ares save.ram is not the EEPROM payload for Bandai mapper 16/157/159
+    ErrPunesCompositeNvram,       // p1=PRG NVRAM bytes, p2=additional NVRAM bytes that cannot be represented by this target
+    ErrPunesNvramTooSmall,        // p1=required PRG NVRAM bytes, p2=ROM-declared PRG NVRAM bytes
 };
 
 struct Issue {

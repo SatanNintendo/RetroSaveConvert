@@ -61,7 +61,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Select the save file",
             L"Select the ROM file (iNES .nes)",
             L"Select the output folder",
-            L"Save files (*.sav;*.eeprom128;*.eeprom256;*.srm)\0*.sav;*.eeprom128;*.eeprom256;*.srm\0All files (*.*)\0*.*\0",
+            L"Save files (*.sav;*.srm;*.prb;*.ram;*.eeprom;*.eeprom128;*.eeprom256)\0*.sav;*.srm;*.prb;*.ram;*.eeprom;*.eeprom128;*.eeprom256\0All files (*.*)\0*.*\0",
             L"ROM images (*.nes;*.unf)\0*.nes;*.unf\0All files (*.*)\0*.*\0",
             L"Select a save file first.",
             L"Could not read the save file:\n%1",
@@ -81,7 +81,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"INFO", L"WARNING", L"ERROR",
             L"Retro Save Converter 1.0\n\n"
             L"Converts in-game battery saves (NOT save states) between NES emulators:\n"
-            L"MesenCE, Nestopia and Nintendulator.\n\n"
+            L"MesenCE, Nestopia, Nintendulator, FCEUX, puNES and ares (NES).\n\n"
             L"Based on the save-format research of each emulator's source code.\n"
             L"MIT License. See LICENSE for details.",
         },
@@ -107,7 +107,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Выберите файл сохранения",
             L"Выберите файл ROM (iNES .nes)",
             L"Выберите папку для результата",
-            L"Файлы сохранений (*.sav;*.eeprom128;*.eeprom256;*.srm)\0*.sav;*.eeprom128;*.eeprom256;*.srm\0Все файлы (*.*)\0*.*\0",
+            L"Файлы сохранений (*.sav;*.srm;*.prb;*.ram;*.eeprom;*.eeprom128;*.eeprom256)\0*.sav;*.srm;*.prb;*.ram;*.eeprom;*.eeprom128;*.eeprom256\0Все файлы (*.*)\0*.*\0",
             L"Образы ROM (*.nes;*.unf)\0*.nes;*.unf\0Все файлы (*.*)\0*.*\0",
             L"Сначала выберите файл сохранения.",
             L"Не удалось прочитать файл сохранения:\n%1",
@@ -127,7 +127,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"ИНФО", L"ВНИМАНИЕ", L"ОШИБКА",
             L"Конвертер сохранений Retro 1.0\n\n"
             L"Конвертирует игровые сохранения (НЕ сейв-стейты) между эмуляторами NES:\n"
-            L"MesenCE, Nestopia и Nintendulator.\n\n"
+            L"MesenCE, Nestopia, Nintendulator, FCEUX, puNES и ares (NES).\n\n"
             L"Форматы сохранений изучены по исходному коду каждого эмулятора.\n"
             L"Лицензия MIT — см. файл LICENSE.",
         },
@@ -139,7 +139,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
 // Core-engine message templates, per language. %1..%3 are replaced with params.
 // ---------------------------------------------------------------------------------------
 inline const wchar_t* MsgTemplate(Msg m, Lang lang) {
-    static const wchar_t* const kMsg[2][19] = {
+    static const wchar_t* const kMsg[2][23] = {
         // -------------------------------------------------------------- English
         {
             /* DetectedSource     */ L"Detected: source %1, type %2, size %3 bytes.",
@@ -161,6 +161,10 @@ inline const wchar_t* MsgTemplate(Msg m, Lang lang) {
             /* ErrDatachUnsupported*/ L"Datach (mapper 157) saves are not supported by Nintendulator.",
             /* ErrReadFile        */ L"Could not read file: %1",
             /* ErrWriteFile       */ L"Could not write file: %1",
+            /* ErrDatachUnsupportedByTarget */ L"The Datach save cannot be represented by %1 for the selected ROM because its external 24C01 storage is unavailable or too small.",
+            /* WarnAresRamUnused  */ L"This ROM uses EEPROM (mapper 16/157/159). In ares, the actual game EEPROM is stored in save.eeprom and, for Datach, external.eeprom; save.ram is a separate RAM region.",
+            /* ErrPunesCompositeNvram */ L"This puNES .prb contains %1 bytes of PRG NVRAM plus %2 bytes of additional NVRAM. Converting it to this target would discard unsupported data; choose puNES as the target to preserve the complete payload.",
+            /* ErrPunesNvramTooSmall */ L"This ROM declares only %2 bytes of PRG NVRAM, but the selected EEPROM requires at least %1 bytes. Choose a compatible ROM/header or another target.",
         },
         // -------------------------------------------------------------- Русский
         {
@@ -183,10 +187,16 @@ inline const wchar_t* MsgTemplate(Msg m, Lang lang) {
             /* ErrDatachUnsupported*/ L"Сохранения Datach (маппер 157) не поддерживаются Nintendulator.",
             /* ErrReadFile        */ L"Не удалось прочитать файл: %1",
             /* ErrWriteFile       */ L"Не удалось записать файл: %1",
+            /* ErrDatachUnsupportedByTarget */ L"Сохранение Datach нельзя представить в формате %1 для выбранного ROM: внешняя EEPROM 24C01 отсутствует в конфигурации или для неё недостаточно памяти.",
+            /* WarnAresRamUnused  */ L"Эта игра использует EEPROM (маппер 16/157/159). В ares настоящая EEPROM игры хранится в save.eeprom, а у Datach также в external.eeprom; save.ram — отдельная область RAM.",
+            /* ErrPunesCompositeNvram */ L"Файл puNES .prb содержит %1 байт PRG NVRAM и ещё %2 байт дополнительных данных NVRAM. При конвертации в выбранный формат эти неподдерживаемые данные будут потеряны; выберите puNES, чтобы сохранить полный файл.",
+            /* ErrPunesNvramTooSmall */ L"В заголовке выбранного ROM указано только %2 байт PRG NVRAM, а для выбранной EEPROM нужно не менее %1 байт. Выберите совместимый ROM/заголовок или другой целевой эмулятор.",
         },
     };
     // keep the enum order of Msg in sync with the tables above
-    static_assert(static_cast<int>(Msg::ErrWriteFile) == 18, "Msg table order");
+    static_assert(static_cast<int>(Msg::ErrDatachUnsupportedByTarget) == 19, "Msg table order");
+    static_assert(static_cast<int>(Msg::ErrPunesCompositeNvram) == 21, "Msg table size/order");
+    static_assert(static_cast<int>(Msg::ErrPunesNvramTooSmall) == 22, "Msg table size/order");
     return kMsg[lang][static_cast<int>(m)];
 }
 

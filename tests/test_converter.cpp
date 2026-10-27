@@ -5,6 +5,7 @@
 #include "../src/converter.h"
 #include "../src/strings.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -79,8 +80,8 @@ static std::vector<uint8_t> MakeNes(int mapper, bool battery, bool nes20 = false
     h[6] = static_cast<uint8_t>(((mapper & 0x0F) << 4) | (battery ? 0x02 : 0) | 0x01);
     h[7] = static_cast<uint8_t>((((mapper >> 4) & 0x0F) << 4) | (nes20 ? 0x08 : 0x00));
     if (nes20) {
+        h[8] = static_cast<uint8_t>(((subMapper & 0x0F) << 4) & 0xF0);
         h[10] = static_cast<uint8_t>((nvramNibble << 4) & 0xF0);
-        h[11] = static_cast<uint8_t>(((subMapper & 0x0F) << 4) & 0xF0);
     }
     return h;
 }
@@ -115,6 +116,13 @@ static void TestHeaderParsing() {
     CHECK(r.isNes20);
     CHECK_EQ(r.subMapper, 3);
     CHECK_EQ(r.batteryRamSize, 64u << 7);  // 8192
+    CHECK_EQ(r.chrBatteryRamSize, 0u);
+
+    std::vector<uint8_t> withChrNvram = MakeNes(16, true, true, 5, 7);
+    withChrNvram[11] = 0x30;  // 512 bytes of CHR NVRAM
+    r = ParseNesHeader(withChrNvram.data(), withChrNvram.size());
+    CHECK_EQ(r.subMapper, 5);
+    CHECK_EQ(r.chrBatteryRamSize, 512u);
 
     std::vector<uint8_t> junk = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     CHECK(!ParseNesHeader(junk.data(), junk.size()).valid);
@@ -440,6 +448,235 @@ static void TestWriteOutputs() {
     CHECK_EQ(r.outputs[0].path, L"C:/mesen/saves2\\Zelda.sav");
 }
 
+static void TestNewEmulators() {
+    std::printf("[test] FCEUX, puNES and ares battery-save layouts\n");
+    RamEnv env;
+
+    const RomInfo mapper1 = ParseNesHeader(MakeNes(1, true).data(), 16);
+    const RomInfo mapper16 = ParseNesHeader(MakeNes(16, true).data(), 16);
+    const RomInfo mapper157 = ParseNesHeader(MakeNes(157, true).data(), 16);
+    const std::vector<uint8_t> c01 = MakeBytes(128, 0x21);
+    const std::vector<uint8_t> c02 = MakeBytes(256, 0x62);
+
+    // FCEUX stores ordinary SRAM as a raw .sav and can be used as a source/target.
+    std::vector<uint8_t> sram = MakeBytes(8192, 0x11);
+    ConvertRequest q = BasicReq(L"C:/fceux/Zelda.sav", sram);
+    q.sourceFormat = Emu::FCEUX;
+    q.target = Emu::Nestopia;
+    q.rom = mapper1;
+    ConvertResult r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs.size(), (size_t)1);
+    CHECK_EQ(r.outputs[0].path, L"C:/fceux/Zelda.sav");
+    CHECK(r.outputs[0].bytes == sram);
+
+    q.target = Emu::Ares;
+    q.outputDir = L"C:/ares/Game.pak";
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/ares/Game.pak\\save.ram");
+    CHECK(r.outputs[0].bytes == sram);
+
+    // FCEUX mapper 157 .sav is 512 bytes: first 128 external 24C01, 128 unused,
+    // then 256 internal 24C02. The converter canonicalizes this to [24C02|24C01].
+    std::vector<uint8_t> fceuxDatach(512, 0xEE);
+    std::copy(c01.begin(), c01.end(), fceuxDatach.begin());
+    std::copy(c02.begin(), c02.end(), fceuxDatach.begin() + 256);
+    q = BasicReq(L"C:/fceux/Datach.sav", fceuxDatach);
+    q.sourceFormat = Emu::FCEUX;
+    q.rom = mapper157;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].bytes.size(), (size_t)384);
+    CHECK(std::equal(c02.begin(), c02.end(), r.outputs[0].bytes.begin()));
+    CHECK(std::equal(c01.begin(), c01.end(), r.outputs[0].bytes.begin() + 256));
+
+    // Nestopia canonical Datach -> FCEUX's padded 512-byte representation.
+    std::vector<uint8_t> canonical = c02;
+    canonical.insert(canonical.end(), c01.begin(), c01.end());
+    q = BasicReq(L"C:/saves/Datach.sav", canonical);
+    q.sourceFormat = Emu::Nestopia;
+    q.rom = mapper157;
+    q.target = Emu::FCEUX;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].bytes.size(), (size_t)512);
+    CHECK(std::equal(c01.begin(), c01.end(), r.outputs[0].bytes.begin()));
+    CHECK(std::all_of(r.outputs[0].bytes.begin() + 128,
+                      r.outputs[0].bytes.begin() + 256,
+                      [](uint8_t b) { return b == 0; }));
+    CHECK(std::equal(c02.begin(), c02.end(), r.outputs[0].bytes.begin() + 256));
+
+    // puNES stores raw .prb contents; accept its optional legacy 8-byte header.
+    q = BasicReq(L"C:/punes/Zelda.prb", sram);
+    q.sourceFormat = Emu::Auto;
+    q.rom = mapper1;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/punes/Zelda.sav");
+    CHECK(r.outputs[0].bytes == sram);
+
+    const uint8_t punesHeader[] = {'F','H','p','u','N','E','S',0};
+    std::vector<uint8_t> oldPunes = sram;
+    oldPunes.insert(oldPunes.begin(), std::begin(punesHeader), std::end(punesHeader));
+    q = BasicReq(L"C:/punes/Zelda.prb", oldPunes);
+    q.sourceFormat = Emu::Auto;
+    q.rom = mapper1;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].bytes.size(), sram.size());
+    CHECK(r.outputs[0].bytes == sram);
+
+    // For mapper 16, puNES places the 24C02 at the start of its PRG-NVRAM area.
+    std::vector<uint8_t> punesMapper16(8192, 0x99);
+    std::copy(c02.begin(), c02.end(), punesMapper16.begin());
+    q = BasicReq(L"C:/punes/Mapper16.prb", punesMapper16);
+    q.sourceFormat = Emu::PuNES;
+    q.rom = mapper16;
+    q.target = Emu::MesenCE;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/punes/Mapper16.eeprom256");
+    CHECK(r.outputs[0].bytes == c02);
+
+    // Other emulator EEPROM -> puNES: the chip is padded into the target PRG-NVRAM
+    // block (classic iNES defaults to 8 KiB), without an FHpuNES header.
+    q = BasicReq(L"C:/saves/Mapper16.eeprom256", c02);
+    q.sourceFormat = Emu::MesenCE;
+    q.rom = mapper16;
+    q.target = Emu::PuNES;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/saves/Mapper16.prb");
+    CHECK_EQ(r.outputs[0].bytes.size(), (size_t)8192);
+    CHECK(std::equal(c02.begin(), c02.end(), r.outputs[0].bytes.begin()));
+    CHECK(std::all_of(r.outputs[0].bytes.begin() + 256, r.outputs[0].bytes.end(),
+                      [](uint8_t b) { return b == 0; }));
+
+    // puNES mapper 157 stores the external 24C01 in the first PRG-NVRAM bytes and
+    // appends the internal 24C02 after the PRG-NVRAM block.
+    std::vector<uint8_t> punesDatach(8192 + 256, 0xA5);
+    std::copy(c01.begin(), c01.end(), punesDatach.begin());
+    std::copy(c02.begin(), c02.end(), punesDatach.begin() + 8192);
+    q = BasicReq(L"C:/punes/Datach.prb", punesDatach);
+    q.sourceFormat = Emu::PuNES;
+    q.rom = mapper157;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].bytes.size(), (size_t)384);
+    CHECK(std::equal(c02.begin(), c02.end(), r.outputs[0].bytes.begin()));
+    CHECK(std::equal(c01.begin(), c01.end(), r.outputs[0].bytes.begin() + 256));
+
+    q = BasicReq(L"C:/saves/Datach.sav", canonical);
+    q.sourceFormat = Emu::Nestopia;
+    q.rom = mapper157;
+    q.target = Emu::PuNES;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/saves/Datach.prb");
+    CHECK_EQ(r.outputs[0].bytes.size(), (size_t)(8192 + 256));
+    CHECK(std::equal(c01.begin(), c01.end(), r.outputs[0].bytes.begin()));
+    CHECK(std::all_of(r.outputs[0].bytes.begin() + 128,
+                      r.outputs[0].bytes.begin() + 8192,
+                      [](uint8_t b) { return b == 0; }));
+    CHECK(std::equal(c02.begin(), c02.end(), r.outputs[0].bytes.begin() + 8192));
+
+    // A .prb with more data than the ROM's PRG-NVRAM prefix contains additional
+    // CHR/mapper battery blocks. Refuse conversion to a simpler format rather
+    // than silently discard that data; retaining puNES as target preserves it.
+    std::vector<uint8_t> composite = MakeBytes(8192 + 256, 0x31);
+    q = BasicReq(L"C:/punes/Composite.prb", composite);
+    q.sourceFormat = Emu::PuNES;
+    q.rom = mapper1;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(!r.ok);
+    CHECK(HasMsg(r, Msg::ErrPunesCompositeNvram));
+    CHECK(r.outputs.empty());
+
+    q.target = Emu::PuNES;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].bytes.size(), composite.size());
+    CHECK(r.outputs[0].bytes == composite);
+
+    // NES 2.0 declares exact NVRAM sizes. Refuse a 256-byte EEPROM when the
+    // target ROM only declares 128 bytes of PRG NVRAM.
+    const RomInfo tooSmallMapper16 =
+        ParseNesHeader(MakeNes(16, true, true, 5, 1).data(), 16);
+    q = BasicReq(L"C:/saves/Mapper16.eeprom256", c02);
+    q.sourceFormat = Emu::MesenCE;
+    q.rom = tooSmallMapper16;
+    q.target = Emu::PuNES;
+    r = Convert(q, env);
+    CHECK(!r.ok);
+    CHECK(HasMsg(r, Msg::ErrPunesNvramTooSmall));
+    CHECK(r.outputs.empty());
+
+    // For NES 2.0 Datach, puNES writes PRG NVRAM, then CHR NVRAM, then 24C02.
+    // The converter must locate the EEPROM after CHR NVRAM and refuse to drop it.
+    std::vector<uint8_t> mapper157Nes20Header = MakeNes(157, true, true, 0, 7);
+    mapper157Nes20Header[11] = 0x30;  // 512 bytes of CHR NVRAM
+    const RomInfo mapper157Nes20 =
+        ParseNesHeader(mapper157Nes20Header.data(), mapper157Nes20Header.size());
+    std::vector<uint8_t> punesDatachWithChr(8192 + 512 + 256, 0x5A);
+    std::copy(c01.begin(), c01.end(), punesDatachWithChr.begin());
+    std::copy(c02.begin(), c02.end(), punesDatachWithChr.begin() + 8192 + 512);
+    q = BasicReq(L"C:/punes/DatachNes20.prb", punesDatachWithChr);
+    q.sourceFormat = Emu::PuNES;
+    q.rom = mapper157Nes20;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(!r.ok);
+    CHECK(HasMsg(r, Msg::ErrPunesCompositeNvram));
+    CHECK(r.outputs.empty());
+    q.target = Emu::PuNES;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK(r.outputs[0].bytes == punesDatachWithChr);
+
+    // ares identifies RAM and EEPROM by fixed file names inside the game's .pak.
+    // save.ram must stay SRAM even if its size happens to match an EEPROM chip.
+    q = BasicReq(L"C:/ares/Game.pak/save.ram", c01);
+    q.sourceFormat = Emu::Auto;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/ares/Game.sav");
+    CHECK(r.outputs[0].bytes == c01);
+
+    // ares Datach uses save.eeprom (24C02) plus external.eeprom (24C01).
+    env.files[L"C:/ares/Datach.pak/external.eeprom"] = c01;
+    q = BasicReq(L"C:/ares/Datach.pak/save.eeprom", c02);
+    q.sourceFormat = Emu::Auto;
+    q.rom = mapper157;
+    q.target = Emu::Nestopia;
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs[0].path, L"C:/ares/Datach.sav");
+    CHECK_EQ(r.outputs[0].bytes.size(), (size_t)384);
+    CHECK(std::equal(c02.begin(), c02.end(), r.outputs[0].bytes.begin()));
+    CHECK(std::equal(c01.begin(), c01.end(), r.outputs[0].bytes.begin() + 256));
+
+    // Any canonical Datach source -> ares creates the two fixed-name package files.
+    q = BasicReq(L"C:/saves/Datach.sav", canonical);
+    q.sourceFormat = Emu::Nestopia;
+    q.rom = mapper157;
+    q.target = Emu::Ares;
+    q.outputDir = L"C:/ares/Converted.pak";
+    r = Convert(q, env);
+    CHECK(r.ok);
+    CHECK_EQ(r.outputs.size(), (size_t)2);
+    CHECK_EQ(r.outputs[0].path, L"C:/ares/Converted.pak\\save.eeprom");
+    CHECK_EQ(r.outputs[1].path, L"C:/ares/Converted.pak\\external.eeprom");
+    CHECK(r.outputs[0].bytes == c02);
+    CHECK(r.outputs[1].bytes == c01);
+}
+
 static void TestStringsTables() {
     std::printf("[test] UI string tables are complete in both languages\n");
     // every UI string must exist in EN and RU
@@ -448,12 +685,14 @@ static void TestStringsTables() {
         CHECK(rsc::Str(static_cast<rsc::StrId>(i), rsc::LANG_RU) != nullptr);
     }
     // every core message template must exist in EN and RU
-    for (int m = 0; m <= static_cast<int>(rsc::Msg::ErrWriteFile); ++m) {
+    for (int m = 0; m <= static_cast<int>(rsc::Msg::ErrPunesNvramTooSmall); ++m) {
         CHECK(rsc::MsgTemplate(static_cast<rsc::Msg>(m), rsc::LANG_EN) != nullptr);
         CHECK(rsc::MsgTemplate(static_cast<rsc::Msg>(m), rsc::LANG_RU) != nullptr);
     }
     // the enum order used by MsgTemplate's tables must not drift
-    CHECK_EQ(static_cast<int>(rsc::Msg::ErrWriteFile), 18);
+    CHECK_EQ(static_cast<int>(rsc::Msg::ErrDatachUnsupportedByTarget), 19);
+    CHECK_EQ(static_cast<int>(rsc::Msg::ErrPunesCompositeNvram), 21);
+    CHECK_EQ(static_cast<int>(rsc::Msg::ErrPunesNvramTooSmall), 22);
 }
 
 int main() {
@@ -466,6 +705,7 @@ int main() {
     TestDatach();
     TestDetectionAndErrors();
     TestWriteOutputs();
+    TestNewEmulators();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

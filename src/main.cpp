@@ -452,12 +452,12 @@ static void LayoutAll() {
 // ========================================================================================
 static void RebuildCombos() {
     // source emulator combo: index matches rsc::Emu exactly
-    // (Auto, MesenCE, Nestopia, Nintendulator, Raw)
-    const wchar_t* emuNames[5] = {Str(S_AutoDetect, g_lang), L"MesenCE", L"Nestopia",
-                                  L"Nintendulator", Str(S_GenericSav, g_lang)};
-    // target emulator combo: MesenCE, Nestopia, Nintendulator, Raw
-    const wchar_t* tgtNames[4] = {L"MesenCE", L"Nestopia", L"Nintendulator",
-                                  Str(S_GenericSav, g_lang)};
+    // Source combo order follows rsc::Emu for safe index-to-enum conversion.
+    const wchar_t* emuNames[8] = {Str(S_AutoDetect, g_lang), L"MesenCE", L"Nestopia",
+                                  L"Nintendulator", Str(S_GenericSav, g_lang), L"FCEUX",
+                                  L"puNES", L"ares (NES)"};
+    const wchar_t* tgtNames[7] = {L"MesenCE", L"Nestopia", L"Nintendulator",
+                                  Str(S_GenericSav, g_lang), L"FCEUX", L"puNES", L"ares (NES)"};
     // content type combo: index matches rsc::SaveType exactly
     const wchar_t* typeNames[5] = {
         Str(S_AutoDetect, g_lang), Str(S_TypeSram, g_lang), Str(S_Type24C01, g_lang),
@@ -466,12 +466,12 @@ static void RebuildCombos() {
     int sel;
     sel = ComboBox_GetCurSel(g_srcEmu);
     ComboBox_ResetContent(g_srcEmu);
-    for (int i = 0; i < 5; ++i) ComboBox_AddString(g_srcEmu, emuNames[i]);
+    for (int i = 0; i < 8; ++i) ComboBox_AddString(g_srcEmu, emuNames[i]);
     ComboBox_SetCurSel(g_srcEmu, (sel == CB_ERR || sel < 0) ? 0 : sel);
 
     sel = ComboBox_GetCurSel(g_tgtEmu);
     ComboBox_ResetContent(g_tgtEmu);
-    for (int i = 0; i < 4; ++i) ComboBox_AddString(g_tgtEmu, tgtNames[i]);
+    for (int i = 0; i < 7; ++i) ComboBox_AddString(g_tgtEmu, tgtNames[i]);
     ComboBox_SetCurSel(g_tgtEmu, (sel == CB_ERR || sel < 0) ? 1 : sel);
 
     sel = ComboBox_GetCurSel(g_type);
@@ -712,7 +712,27 @@ static void TryAutoRom(const std::wstring& savePath) {
     std::wstring rom = GetEditText(g_romFile);
     if (!rom.empty()) return;
     WinEnv env;
-    const std::wstring guess = GetDirOf(savePath) + GetBaseNoExtOf(savePath) + L".nes";
+
+    std::wstring saveName = savePath;
+    const size_t slash = saveName.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) saveName = saveName.substr(slash + 1);
+    saveName = ToLowerW(saveName);
+
+    std::wstring guess;
+    if (saveName == L"save.ram" || saveName == L"save.eeprom" ||
+        saveName == L"external.eeprom") {
+        // ares' fixed save files live in <game>.pak; the ROM is normally next
+        // to that package and named after the package, not after "save".
+        std::wstring packageDir = GetDirOf(savePath);
+        while (!packageDir.empty() &&
+               (packageDir.back() == L'\\' || packageDir.back() == L'/'))
+            packageDir.pop_back();
+        if (GetExtOf(packageDir) == L".pak")
+            guess = GetDirOf(packageDir) + GetBaseNoExtOf(packageDir) + L".nes";
+    }
+    if (guess.empty())
+        guess = GetDirOf(savePath) + GetBaseNoExtOf(savePath) + L".nes";
+
     if (env.FileExists(guess)) {
         SetWindowTextW(g_romFile, guess.c_str());
         LogLine(rsc::Expand(Str(S_DroppedRom, g_lang), {guess}));
@@ -757,8 +777,8 @@ static void OnConvert() {
     sel = ComboBox_GetCurSel(g_type);
     req.saveType = (sel == CB_ERR) ? SaveType::Auto : static_cast<SaveType>(sel);
     sel = ComboBox_GetCurSel(g_tgtEmu);
-    static const Emu tgtMap[4] = {Emu::MesenCE, Emu::Nestopia, Emu::Nintendulator,
-                                  Emu::Raw};
+    static const Emu tgtMap[7] = {Emu::MesenCE, Emu::Nestopia, Emu::Nintendulator,
+                                  Emu::Raw, Emu::FCEUX, Emu::PuNES, Emu::Ares};
     req.target = (sel >= 0 && sel < static_cast<int>(sizeof(tgtMap) / sizeof(tgtMap[0])))
                      ? tgtMap[sel]
                      : Emu::Nestopia;
@@ -831,7 +851,8 @@ static void OnDropFiles(HDROP hd) {
     if (ext == L".nes" || ext == L".unf") {
         SetWindowTextW(g_romFile, path.c_str());
         LogLine(rsc::Expand(Str(S_DroppedRom, g_lang), {path}));
-    } else if (ext == L".sav" || ext == L".srm" || ext == L".eeprom128" ||
+    } else if (ext == L".sav" || ext == L".srm" || ext == L".prb" ||
+               ext == L".ram" || ext == L".eeprom" || ext == L".eeprom128" ||
                ext == L".eeprom256") {
         SetWindowTextW(g_srcFile, path.c_str());
         LogLine(rsc::Expand(Str(S_DroppedSave, g_lang), {path}));

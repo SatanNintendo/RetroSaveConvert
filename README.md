@@ -15,9 +15,14 @@ Compatible with **Windows 7 x64 and later** — a single ~330 KB static executab
 | **MesenCE** | `<game>.sav`, `<game>.eeprom128`, `<game>.eeprom256` | ✅ | ✅ | ✅ | ✅ (pair of files) |
 | **Nestopia** | `<game>.sav` | ✅ | ✅ | ✅ | ✅ (384-byte file) |
 | **Nintendulator** | `<game>.sav` (in `SRAM\` subfolder) | ✅ | ✅ | ✅ | ❌ not supported by the emulator itself |
-| **Generic (.sav)** | `<game>.sav` | ✅ | ✅ | ✅ | ✅ |
+| **FCEUX** | `<game>.sav` (raw concatenated save buffers) | ✅ | ✅ | ✅ | ✅ (512-byte buffer layout) |
+| **puNES** | `<game>.prb` (raw NVRAM payload) | ✅ | ✅ | ✅ | ✅ (PRG NVRAM + 24C02 payload) |
+| **ares (NES)** | `<game>.pak/save.ram`, `save.eeprom`, `external.eeprom` | ✅ | ✅ | ✅ | ✅ (`save.eeprom` + `external.eeprom`) |
+| **Generic (.sav)** | `<game>.sav` | ✅ | ✅ | ✅ | ✅ (canonical 384-byte layout) |
 
-All directions between the supported emulators work. A `Generic (.sav)` source/target is handy for other emulators that use plain raw dumps (FCEUX, PuNES, VirtuaNES, most front-ends) — for regular SRAM games such a conversion is a plain copy, for EEPROM boards it is a raw chip dump.
+FCEUX uses the same raw `.sav` extension as several other emulators, so select **FCEUX** manually when importing its mapper-157 save: the 512-byte layout is different from ordinary SRAM. puNES is auto-detected from `.prb`. ares is auto-detected from its fixed `save.ram`, `save.eeprom`, and `external.eeprom` names. For output **to** ares, choose the target game's `.pak` directory as the output folder; the converter writes the filenames expected inside that package. When converting **from** ares to another emulator, the default output is named after the `.pak` directory and placed beside the package. The ROM auto-detection also checks for a matching `.nes` beside the package.
+
+EEPROM chip contents are copied byte-for-byte when the source contains the complete chip data; Datach is rearranged only where an emulator uses a different block layout. Target-specific size normalization is reported in the log. A puNES `.prb` can also contain CHR NVRAM or additional mapper-specific data. When such extra payload is detected and the requested target cannot represent it, the converter refuses the conversion rather than silently discarding those bytes. Keeping puNES as the target preserves the complete `.prb` payload.
 
 `SNES/SFC` and `N64` tabs are already in the interface and will receive their converters in future versions.
 
@@ -50,10 +55,20 @@ This converter was written by reading the actual emulator sources — this is wh
   * `src/NES.cpp` (`SaveSRAM`/`LoadSRAM`) — saves raw `SRAM_Size` bytes into `<DataPath>\SRAM\<game>.sav`; size mismatch only produces a warning.
   * `src/iNES/mapper016.cpp` — mapper 16 = 24C02 (256 B), mapper 159 = 24C01 (128 B); the EEPROM lives in the PRG-RAM window at $6000, so the `.sav` is exactly the chip dump.
   * `src/Dll/d_iNES.cpp` — plain iNES battery games get `SRAM_Size = 8192`; NES 2.0 sizes come from the header. Mapper 157 (Datach) is not supported at all.
+* **FCEUX** (`TASEmulators/fceux`)
+  * `src/cart.cpp` (`FCEU_SaveGameSave` / `FCEU_LoadGameSave`) writes/reads each registered battery buffer sequentially to `<game>.sav`, without a header.
+  * `src/boards/bandai.cpp` registers mapper 16 as 256 bytes, mapper 159 as 128 bytes, and mapper 157 as a 512-byte buffer. For mapper 157, the 24C01 data is at bytes 0–127, bytes 128–255 are unused padding, and the 24C02 is at bytes 256–511. The converter translates this to/from its canonical `[24C02 256 B | 24C01 128 B]` order.
+* **puNES** (`punesemu/puNES`)
+  * `src/core/memmap.c` (`nvram_load_file` / `nvram_save_file`) stores raw NVRAM sequentially in `<game>.prb`: PRG NVRAM, CHR NVRAM, then mapper-specific battery data. It may accept an older `FHpuNES\0` prefix, but the current writer has its header write disabled.
+  * `src/core/ines.c` defaults legacy iNES battery RAM to 8 KiB. `src/core/mappers/mapper_157.c` stores the external 24C01 in PRG NVRAM and appends the internal 256-byte 24C02 via `extcl_battery_io_157`.
+  * Because `.prb` can combine several kinds of NVRAM in one file, conversion to a simpler save format is refused when extra unsupported battery blocks would be lost. Mapper-16/159 EEPROM is taken from the beginning of the PRG NVRAM prefix; Datach is unpacked using the ROM's declared prefix size.
+* **ares (NES)** (`ares-emulator/ares`)
+  * `ares/fc/cartridge/board/bandai-lz93d50.cpp` reads/writes raw `save.ram` and `save.eeprom`; EEPROM file size distinguishes 128-byte 24C01 from 256-byte 24C02.
+  * `ares/fc/cartridge/board/bandai-datach.cpp` additionally reads/writes `external.eeprom` (128 bytes). The files live inside the game `.pak` directory, not in a single `.sav` file.
 
-**A key finding:** all three emulators store EEPROM bytes in memory in exactly the same bit order (24C01 — LSB-first, 24C02 — MSB-first), so no bit-reversal is ever needed; conversions are byte-preserving, and the only differences are file names/extensions and the Datach split/merge. This has been verified in each emulator's chip-driver code (`Eeprom24C01.h` / `X24C0X<128>` / `EEPROM_24C01` respectively).
+EEPROM bytes are transferred as raw bytes; the converter does not reverse bits or add proprietary headers. Datach is rearranged only where an emulator uses a different block layout. The implementation above was checked against the source files shipped in the supplied FCEUX, puNES, and ares repositories.
 
-The core engine is covered by **260 unit checks** (`tests/test_converter.cpp`) that round-trip every save kind between all emulators, split/merge Datach pairs, and verify padding/backup/refusal logic.
+The core engine is covered by **341 unit checks** (`tests/test_converter.cpp`), including FCEUX's 512-byte Datach layout, puNES headers/NVRAM prefix handling and composite-file refusal, ares fixed filenames, and the existing backup/refusal logic.
 
 ## Building
 
@@ -122,7 +137,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Credits
 
-* Format research is based on the open source code of [MesenCE](https://github.com/nesdev-org/MesenCE), [Nestopia](https://github.com/0ldsk00l/nestopia) and [Nintendulator](https://github.com/quietust/nintendulator) (plus its [mapper DLLs](https://github.com/quietust/nintendulator-mappers)). All trademarks belong to their respective owners.
+* Format research is based on the open source code of [MesenCE](https://github.com/nesdev-org/MesenCE), [Nestopia](https://github.com/0ldsk00l/nestopia) and [Nintendulator](https://github.com/quietust/nintendulator) (plus its [mapper DLLs](https://github.com/quietust/nintendulator-mappers)), [FCEUX](https://github.com/TASEmulators/fceux), [puNES](https://github.com/punesemu/puNES) and [ares](https://github.com/ares-emulator/ares). All trademarks belong to their respective owners.
 
 ---
 
@@ -151,17 +166,20 @@ MIT — see [LICENSE](LICENSE).
 
 Кратко (полностью — в английской части выше, с указанием конкретных файлов исходного кода):
 
-* **MesenCE**: обычный SRAM — в `<игра>.sav`; EEPROM — в отдельных файлах `<игра>.eeprom128` / `<игра>.eeprom256` (128/256 байт, без заголовков). Datach (маппер 157) использует оба файла.
+* **MesenCE**: обычный SRAM — в `<игра>.sav`; EEPROM — в `<игра>.eeprom128` / `<игра>.eeprom256`. Datach (маппер 157) использует оба файла.
 * **Nestopia**: всё — в один `<игра>.sav`; для Datach оба чипа склеены в один файл 384 байта (24C02 ‖ 24C01).
-* **Nintendulator**: `<папка>\SRAM\<игра>.sav` — точный дамп области SRAM (8 КБ для обычных игр; 256/128 байт для мапперов 16/159). Datach не поддерживается самим эмулятором.
-* Порядок бит EEPROM у всех трёх эмуляторов совпадает (24C01 — LSB-first, 24C02 — MSB-first), поэтому данные передаются без перестановок — меняются только имена/расширения файлов и разбиение Datach.
+* **Nintendulator**: `<папка>\SRAM\<игра>.sav` — дамп SRAM (обычно 8 КБ; 256/128 байт для мапперов 16/159). Datach не поддерживается самим эмулятором.
+* **FCEUX**: `<игра>.sav` — последовательность raw-буферов батарейной памяти. Datach занимает 512 байт: 24C01 в начале, 128 байт неиспользуемого промежутка, затем 24C02.
+* **puNES**: `<игра>.prb` — raw NVRAM без обязательного заголовка: PRG NVRAM, CHR NVRAM и mapper-данные могут быть объединены. Для Datach 24C01 хранится в PRG NVRAM, а 24C02 добавляется в конец.
+* **ares (NES)**: внутри `<игра>.pak` используются отдельные `save.ram`, `save.eeprom` и, для Datach, `external.eeprom`.
+* При конвертации **в** ares указывайте `.pak` нужной игры как папку результата. При конвертации **из** ares обычный файл по умолчанию создаётся рядом с `.pak` и называется по имени игры; поиск ROM также проверяет соседний `<игра>.nes`. Если puNES `.prb` содержит дополнительные блоки CHR/mapper NVRAM, которые выбранный целевой формат не поддерживает, конвертер откажется от преобразования, чтобы не потерять данные.
 
 ## Сборка
 
 * **GitHub Actions**: вкладка *Actions* → *Manual build (Windows exe)* → *Run workflow* → скачать артефакт `RetroSaveConverter-win64`.
 * **Windows локально**: `build.cmd` (сам найдёт MinGW-w64 или MSVC).
 * **Linux (кросс)**: `sudo apt-get install g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 && ./build.sh`.
-* **Тесты**: `g++ -std=c++17 -O1 -Wall -Wextra -o test_converter tests/test_converter.cpp src/converter.cpp && ./test_converter` — 260 проверок.
+* **Тесты**: `g++ -std=c++17 -O1 -Wall -Wextra -o test_converter tests/test_converter.cpp src/converter.cpp && ./test_converter` — 341 проверка.
 
 ### Предупреждение Windows об издателе
 
