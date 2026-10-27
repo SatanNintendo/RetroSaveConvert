@@ -53,7 +53,13 @@ static HMENU       g_menuLanguage = nullptr;
 static HMENU       g_menuView = nullptr;
 static HMENU       g_menuHelp = nullptr;
 
-static HWND g_grpSource, g_grpTarget, g_grpOptions;
+// The three section panels ("Source", "Target", "Options") are NOT child windows.
+// They used to be owner-drawn BS_GROUPBOX controls; an opaque owner-drawn group box
+// that is repainted (after a combo drop-down closes, after a file dialog closes, ...)
+// paints over its sibling controls and makes them "disappear". The panels are now
+// painted by the main window itself (see PaintPanels) and are rebuilt by LayoutAll.
+static const int kPanelCount = 3;
+static RECT g_panelRc[kPanelCount];
 static HWND g_lblSrcEmu, g_srcEmu;
 static HWND g_lblSave,   g_srcFile, g_btnSrcBrowse;
 static HWND g_lblRom,    g_romFile, g_btnRomBrowse;
@@ -66,6 +72,7 @@ static rsc::Lang g_lang = rsc::LANG_EN;
 static bool      g_darkTheme = false;
 static HBRUSH    g_brushWindow = nullptr;
 static HBRUSH    g_brushEdit = nullptr;
+static HBRUSH    g_brushSurface = nullptr;
 static float     g_scale = 1.0f;
 
 static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -89,14 +96,19 @@ static COLORREF ThemeAccentTextColor()  { return RGB(255, 255, 255); }
 static void RecreateThemeBrushes() {
     if (g_brushWindow) { DeleteObject(g_brushWindow); g_brushWindow = nullptr; }
     if (g_brushEdit) { DeleteObject(g_brushEdit); g_brushEdit = nullptr; }
+    if (g_brushSurface) { DeleteObject(g_brushSurface); g_brushSurface = nullptr; }
     // Keep app-owned brushes in light as well as dark mode so the UI never falls
     // back to the raised, system-grey Win9x button face between repaints.
     g_brushWindow = CreateSolidBrush(ThemeWindowColor());
     g_brushEdit = CreateSolidBrush(ThemeEditColor());
+    g_brushSurface = CreateSolidBrush(ThemeSurfaceColor());
 }
 
 static HBRUSH ThemeWindowBrush() {
     return g_brushWindow ? g_brushWindow : GetSysColorBrush(COLOR_BTNFACE);
+}
+static HBRUSH ThemeSurfaceBrush() {
+    return g_brushSurface ? g_brushSurface : GetSysColorBrush(COLOR_WINDOW);
 }
 static HBRUSH ThemeEditBrush() {
     return g_brushEdit ? g_brushEdit : GetSysColorBrush(COLOR_WINDOW);
@@ -344,20 +356,20 @@ static void LoadThemeIni() {
 // Control factory helpers
 // ========================================================================================
 static HWND MkStatic(HWND parent, int id, DWORD style, int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | style, x, y, w, h,
+    return CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
+                           x, y, w, h,
                            parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                            g_hInst, nullptr);
 }
 
 static HWND MkButton(HWND parent, int id, DWORD style, int x, int y, int w, int h) {
-    // Custom-draw push buttons and group panels use the same flat, rounded theme.
+    // Custom-draw push buttons use the same flat, rounded theme.
     // Checkboxes stay native so their keyboard and accessibility behavior is retained.
     const DWORD type = style & BS_TYPEMASK;
-    const bool groupBox = type == BS_GROUPBOX;
     const bool pushButton = type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON;
-    if (groupBox || pushButton) style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW;
-    const DWORD tabStop = groupBox ? 0 : WS_TABSTOP;
-    return CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | tabStop | style,
+    if (pushButton) style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW;
+    return CreateWindowExW(0, L"BUTTON", L"",
+                           WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | style,
                            x, y, w, h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
                            nullptr);
@@ -368,30 +380,25 @@ static bool IsOwnerDrawPushButton(HWND control) {
                        control == g_btnOutDirBrowse || control == g_convert);
 }
 
-static bool IsOwnerDrawGroupBox(HWND control) {
-    return control && (control == g_grpSource || control == g_grpTarget ||
-                       control == g_grpOptions);
-}
-
 static HWND MkEdit(HWND parent, int id, int x, int y, int w, int h) {
     return CreateWindowExW(0, L"EDIT", L"",
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, x, y, w,
-                           h, parent,
+                           WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WS_BORDER |
+                               ES_AUTOHSCROLL,
+                           x, y, w, h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
                            nullptr);
 }
 
 static HWND MkCombo(HWND parent, int id, int x, int y, int w, int h) {
     return CreateWindowExW(0, L"COMBOBOX", L"",
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
-                               WS_VSCROLL,
+                           WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                               CBS_DROPDOWNLIST | WS_VSCROLL,
                            x, y, w, h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
                            nullptr);
 }
 
 static HWND* const kNesCtrls[] = {
-    &g_grpSource, &g_grpTarget, &g_grpOptions,
     &g_lblSrcEmu, &g_srcEmu, &g_lblSave, &g_srcFile, &g_btnSrcBrowse,
     &g_lblRom, &g_romFile, &g_btnRomBrowse,
     &g_lblType, &g_type,
@@ -411,10 +418,13 @@ static void ShowNesPage(bool show) {
 static void LayoutAll() {
     RECT rc = {};
     if (!g_main || !g_tabs || !GetClientRect(g_main, &rc)) return;
-    MoveWindow(g_tabs, 0, 0, rc.right, rc.bottom, TRUE);
 
     RECT disp = rc;
     SendMessageW(g_tabs, TCM_ADJUSTRECT, FALSE, reinterpret_cast<LPARAM>(&disp));
+    // The tab control is only the strip with the three captions. It must NOT cover
+    // the whole client area: a full-size tab control would sit underneath the panels
+    // that the main window paints and hide them.
+    MoveWindow(g_tabs, 0, 0, rc.right, (disp.top > SX(28)) ? disp.top : SX(28), TRUE);
     const int x0 = disp.left + SX(10);
     const int W  = disp.right - disp.left - SX(20);
 
@@ -431,7 +441,7 @@ static void LayoutAll() {
     // -- group: source ---------------------------------------------------------------
     const int srcRows = 4;
     const int comboH = SX(200);   // dropdown list height (closed height is font-based)
-    MoveWindow(g_grpSource, x0, y, W, SX(24) + srcRows * rowP + SX(8), TRUE);
+    SetRect(&g_panelRc[0], x0, y, x0 + W, y + SX(24) + srcRows * rowP + SX(8));
     y += SX(24);
     MoveWindow(g_lblSrcEmu, x0 + SX(10), y, lblW, rowH, TRUE);
     MoveWindow(g_srcEmu, cx, y - SX(3), cw + SX(96), comboH, TRUE);
@@ -449,8 +459,8 @@ static void LayoutAll() {
     y += rowP + SX(12);
 
     // -- group: target ---------------------------------------------------------------
-    MoveWindow(g_grpTarget, x0, y, W, SX(24) + 2 * rowP + SX(2) + SX(14) + SX(10),
-               TRUE);
+    SetRect(&g_panelRc[1], x0, y, x0 + W,
+            y + SX(24) + 2 * rowP + SX(2) + SX(14) + SX(10));
     y += SX(24);
     MoveWindow(g_lblTgt, x0 + SX(10), y, lblW, rowH, TRUE);
     MoveWindow(g_tgtEmu, cx, y - SX(3), cw + SX(96), comboH, TRUE);
@@ -463,7 +473,7 @@ static void LayoutAll() {
     y += SX(16) + SX(10);
 
     // -- group: options --------------------------------------------------------------
-    MoveWindow(g_grpOptions, x0, y, W, SX(24) + rowP + SX(6), TRUE);
+    SetRect(&g_panelRc[2], x0, y, x0 + W, y + SX(24) + rowP + SX(6));
     y += SX(24);
     MoveWindow(g_backup, x0 + SX(10), y, W - SX(20), rowH + SX(2), TRUE);
     y += rowP + SX(6);
@@ -693,10 +703,6 @@ static void ApplyLanguage(rsc::Lang lang, bool saveIni) {
     g_lang = lang;
 
     SetWindowTextW(g_main, Str(S_AppTitle, lang));
-
-    SetWindowTextW(g_grpSource, Str(S_GrpSource, lang));
-    SetWindowTextW(g_grpTarget, Str(S_GrpTarget, lang));
-    SetWindowTextW(g_grpOptions, Str(S_GrpOptions, lang));
 
     SetWindowTextW(g_lblSrcEmu, Str(S_SrcEmu, lang));
     SetWindowTextW(g_lblSave, Str(S_SaveFile, lang));
@@ -955,39 +961,52 @@ static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-// The main window deliberately does not use WS_CLIPCHILDREN because transparent
-// STATIC labels need the parent background underneath them. However, background
-// erasure must not be allowed to paint over opaque native controls (ComboBox/Edit)
-// or owner-drawn controls. Clip only those rectangles while erasing the parent.
-// This avoids stale/vanishing controls without preventing transparent labels from
-// showing the themed background.
-static void ExcludeChildRect(HDC dc, HWND parent, HWND child) {
-    if (!dc || !parent || !child || !IsWindowVisible(child)) return;
-    RECT childRect = {};
-    if (!GetWindowRect(child, &childRect)) return;
-    POINT points[2] = {{childRect.left, childRect.top},
-                       {childRect.right, childRect.bottom}};
-    MapWindowPoints(nullptr, parent, points, 2);
-    ExcludeClipRect(dc, points[0].x, points[0].y, points[1].x, points[1].y);
+// Draws the rounded "Source / Target / Options" panels in main-window client
+// coordinates. Called from WM_ERASEBKGND, which Windows also uses to obtain the
+// parent background for themed child controls (DrawThemeParentBackground) -- so
+// native checkboxes get the panel colour behind them too.
+static void PaintPanels(HDC dc) {
+    if (!g_tabs || TabCtrl_GetCurSel(g_tabs) != 0) return;   // panels belong to the NES page
+    const StrId captions[kPanelCount] = {S_GrpSource, S_GrpTarget, S_GrpOptions};
+    for (int i = 0; i < kPanelCount; ++i) {
+        const RECT& r = g_panelRc[i];
+        if (r.right <= r.left || r.bottom <= r.top) continue;
+
+        RECT panel = r;
+        InflateRect(&panel, -SX(1), -SX(1));
+        DrawRoundedSurface(dc, panel, ThemeSurfaceColor(), ThemeBorderColor(), 8);
+
+        const wchar_t* caption = Str(captions[i], g_lang);
+        RECT textRc = panel;
+        textRc.left += SX(12);
+        textRc.top += SX(4);
+        textRc.right -= SX(10);
+        textRc.bottom = textRc.top + SX(20);
+        const int oldMode = SetBkMode(dc, TRANSPARENT);
+        const COLORREF oldColor = SetTextColor(dc, ThemeTextColor());
+        HGDIOBJ oldFont = g_fontStrong ? SelectObject(dc, g_fontStrong) : nullptr;
+        DrawTextW(dc, caption, -1, &textRc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (oldFont) SelectObject(dc, oldFont);
+        SetTextColor(dc, oldColor);
+        SetBkMode(dc, oldMode);
+    }
 }
 
+// The main window has WS_CLIPCHILDREN, so this erase can never paint over a child
+// control; children repaint themselves (labels and buttons are opaque and use the
+// same colours as the panel they sit on).
 static void EraseMainBackground(HWND hwnd, HDC dc) {
     RECT client = {};
     GetClientRect(hwnd, &client);
-    const int saved = SaveDC(dc);
-    if (saved == 0) {
-        FillRect(dc, &client, ThemeWindowBrush());
-        return;
-    }
-    const HWND opaqueChildren[] = {
-        g_tabs, g_grpSource, g_grpTarget, g_grpOptions,
-        g_srcEmu, g_type, g_tgtEmu,
-        g_srcFile, g_romFile, g_outDir, g_log,
-        g_btnSrcBrowse, g_btnRomBrowse, g_btnOutDirBrowse, g_convert
-    };
-    for (HWND child : opaqueChildren) ExcludeChildRect(dc, hwnd, child);
     FillRect(dc, &client, ThemeWindowBrush());
-    RestoreDC(dc, saved);
+    PaintPanels(dc);
+}
+
+static void FillSolid(HDC dc, const RECT& rc, COLORREF color) {
+    const COLORREF old = SetBkColor(dc, color);
+    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &rc, nullptr, 0, nullptr);
+    SetBkColor(dc, old);
 }
 
 // ========================================================================================
@@ -1044,12 +1063,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             const int lx = SX(140), lh = SX(26);
             // NES page controls (positions set in LayoutAll)
-            g_grpSource =
-                MkButton(hwnd, IDC_GRP_SOURCE, BS_GROUPBOX, 0, 0, 10, 10);
-            g_grpTarget =
-                MkButton(hwnd, IDC_GRP_TARGET, BS_GROUPBOX, 0, 0, 10, 10);
-            g_grpOptions =
-                MkButton(hwnd, IDC_GRP_OPTIONS, BS_GROUPBOX, 0, 0, 10, 10);
             g_lblSrcEmu = MkStatic(hwnd, IDC_LBL_SRC_EMU, 0, 0, 0, lx, lh);
             g_srcEmu    = MkCombo(hwnd, IDC_SRC_EMU, 0, 0, lx + SX(120), lh);
             g_lblSave   = MkStatic(hwnd, IDC_LBL_SAVE, 0, 0, 0, lx, lh);
@@ -1074,8 +1087,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_lblLog   = MkStatic(hwnd, IDC_LBL_LOG, 0, 0, 0, lx, SX(16));
             g_log      = CreateWindowExW(
                 0, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | ES_MULTILINE |
-                    ES_AUTOVSCROLL | ES_READONLY,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WS_BORDER | WS_VSCROLL |
+                    ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                 0, 0, lx, lh, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOG)), g_hInst, nullptr);
 
@@ -1098,11 +1111,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(g_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
             for (HWND* h : kNesCtrls)
                 if (*h) SendMessageW(*h, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-            if (g_fontStrong) {
-                SendMessageW(g_grpSource, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontStrong), TRUE);
-                SendMessageW(g_grpTarget, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontStrong), TRUE);
-                SendMessageW(g_grpOptions, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontStrong), TRUE);
-            }
             SendMessageW(g_placeholder, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
             LoadLangIni();
@@ -1130,17 +1138,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CTLCOLORLISTBOX: {
             HDC dc = reinterpret_cast<HDC>(wParam);
             HWND control = reinterpret_cast<HWND>(lParam);
-            if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+            // The read-only log is an EDIT, but Windows reports read-only edits via
+            // WM_CTLCOLORSTATIC; paint it like every other edit.
+            if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX || control == g_log) {
                 SetTextColor(dc, ThemeTextColor());
                 SetBkMode(dc, OPAQUE);
                 SetBkColor(dc, ThemeEditColor());
                 return reinterpret_cast<INT_PTR>(ThemeEditBrush());
             }
+            // Labels and the checkbox sit on a panel (surface colour); the log caption
+            // and the "coming soon" placeholder sit directly on the window colour.
+            const bool onWindow = control == g_lblLog || control == g_placeholder;
             const bool muted = control == g_lblOutDirHint || control == g_lblLog;
+            const COLORREF bg = onWindow ? ThemeWindowColor() : ThemeSurfaceColor();
             SetTextColor(dc, muted ? ThemeMutedTextColor() : ThemeTextColor());
-            SetBkMode(dc, TRANSPARENT);
-            SetBkColor(dc, ThemeWindowColor());
-            return reinterpret_cast<INT_PTR>(ThemeWindowBrush());
+            SetBkMode(dc, OPAQUE);
+            SetBkColor(dc, bg);
+            return reinterpret_cast<INT_PTR>(onWindow ? ThemeWindowBrush() : ThemeSurfaceBrush());
         }
 
         case WM_THEMECHANGED:
@@ -1209,29 +1223,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 return TRUE;
             }
 
-            if (dis->CtlType == ODT_BUTTON && IsOwnerDrawGroupBox(dis->hwndItem)) {
-                FillRect(dis->hDC, &dis->rcItem, ThemeWindowBrush());
-                RECT panel = dis->rcItem;
-                InflateRect(&panel, -SX(1), -SX(1));
-                DrawRoundedSurface(dis->hDC, panel, ThemeSurfaceColor(), ThemeBorderColor(), 8);
-
-                wchar_t caption[128] = {};
-                GetWindowTextW(dis->hwndItem, caption, static_cast<int>(std::size(caption)));
-                RECT textRc = panel;
-                textRc.left += SX(12);
-                textRc.top += SX(4);
-                textRc.right -= SX(10);
-                textRc.bottom = textRc.top + SX(20);
-                SetBkMode(dis->hDC, TRANSPARENT);
-                SetTextColor(dis->hDC, ThemeTextColor());
-                HGDIOBJ oldFont = nullptr;
-                if (g_fontStrong) oldFont = SelectObject(dis->hDC, g_fontStrong);
-                DrawTextW(dis->hDC, caption, -1, &textRc,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                if (oldFont) SelectObject(dis->hDC, oldFont);
-                return TRUE;
-            }
-
             if (dis->CtlType == ODT_BUTTON && IsOwnerDrawPushButton(dis->hwndItem)) {
                 const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
                 const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
@@ -1240,7 +1231,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const bool primary = dis->hwndItem == g_convert;
                 RECT button = dis->rcItem;
                 InflateRect(&button, -SX(1), -SX(1));
-                FillRect(dis->hDC, &dis->rcItem, ThemeWindowBrush());
+                // Corners outside the rounded button show whatever the button sits on:
+                // a panel (Browse buttons) or the plain window (Convert button).
+                const COLORREF surround = primary ? ThemeWindowColor() : ThemeSurfaceColor();
+                FillSolid(dis->hDC, dis->rcItem, surround);
 
                 COLORREF fill = ThemeSurfaceColor();
                 COLORREF border = ThemeBorderColor();
@@ -1256,7 +1250,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (focused) border = ThemeAccentColor();
                 }
                 if (disabled) {
-                    fill = ThemeWindowColor();
+                    fill = surround;
                     border = ThemeBorderColor();
                     text = ThemeMutedTextColor();
                 }
@@ -1290,6 +1284,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SetWindowTextW(g_placeholder,
                                (sel == 2) ? Str(S_ComingSoonN64, g_lang)
                                           : Str(S_ComingSoonSnes, g_lang));
+                // Panels are painted by the main window: repaint so they appear/disappear
+                // together with the controls of the NES page.
+                RedrawWindow(g_main, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
             }
             return 0;
         }
@@ -1390,6 +1388,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             if (g_brushWindow) { DeleteObject(g_brushWindow); g_brushWindow = nullptr; }
             if (g_brushEdit) { DeleteObject(g_brushEdit); g_brushEdit = nullptr; }
+            if (g_brushSurface) { DeleteObject(g_brushSurface); g_brushSurface = nullptr; }
             if (g_main == hwnd) g_main = nullptr;
             return result;
         }
@@ -1411,10 +1410,18 @@ static bool IsComboDropDownOpen() {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hInst = hInstance;
 
+    // BIF_NEWDIALOGSTYLE (resizable folder picker) requires COM/OLE to be initialised
+    // on the UI thread, otherwise the "Browse" button for the output folder misbehaves.
+    const HRESULT oleHr = OleInitialize(nullptr);
+    const bool oleReady = SUCCEEDED(oleHr);
+
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
-    if (!InitCommonControlsEx(&icc)) return 1;
+    if (!InitCommonControlsEx(&icc)) {
+        if (oleReady) OleUninitialize();
+        return 1;
+    }
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -1432,6 +1439,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassExW(&wc)) {
         if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+        if (oleReady) OleUninitialize();
         return 1;
     }
 
@@ -1450,12 +1458,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     RECT adj = {0, 0, W, H};
     AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
 
-    // Keep the normal child-window clipping behavior here. The parent owns a
-    // custom WM_ERASEBKGND handler and several controls use transparent/native
-    // painting; WS_CLIPCHILDREN prevented parts of the child tree from painting
-    // correctly on initial display. WM_SIZE and WM_EXITSIZEMOVE explicitly repaint
-    // the children instead so their contents stay visible during resizing.
-    const DWORD mainStyle = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX);
+    // WS_CLIPCHILDREN: the parent's background/panel painting must never draw over
+    // child controls. Every child is opaque (see WM_CTLCOLOR*), so nothing depends on
+    // the parent background showing through.
+    const DWORD mainStyle =
+        (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
     g_main = CreateWindowExW(0, L"RetroSaveConverterWnd", L"Retro Save Converter",
                              mainStyle, CW_USEDEFAULT, CW_USEDEFAULT,
                              adj.right - adj.left, adj.bottom - adj.top,
@@ -1463,6 +1470,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (!g_main) {
         UnregisterClassW(wc.lpszClassName, hInstance);
         if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+        if (oleReady) OleUninitialize();
         return 1;
     }
 
@@ -1496,5 +1504,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     const int exitCode = (messageResult == -1) ? 1 : static_cast<int>(msg.wParam);
     UnregisterClassW(wc.lpszClassName, hInstance);
     if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+    if (oleReady) OleUninitialize();
     return exitCode;
 }
