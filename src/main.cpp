@@ -1,7 +1,7 @@
 // ========================================================================================
 // RetroSaveConverter — Win32 GUI entry point
 // Target: Windows 7 x64 and later; built with MinGW-w64 or MSVC.
-// No external dependencies: user32, gdi32, comctl32, comdlg32, shell32, ole32, advapi32.
+// No external dependencies: user32, gdi32, comctl32, comdlg32, shell32, ole32.
 // ========================================================================================
 #ifndef UNICODE
 #define UNICODE
@@ -25,12 +25,10 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <uxtheme.h>    // SetWindowTheme (DarkMode_Explorer)
 
 #include <algorithm>
-#include <cctype>
-#include <cstdio>
 #include <cwctype>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -48,6 +46,9 @@ static HWND        g_main    = nullptr;
 static HWND        g_tabs    = nullptr;
 static HWND        g_placeholder = nullptr;   // SNES/N64 "coming soon" label
 static HFONT       g_font    = nullptr;
+static HMENU       g_menuBar = nullptr;
+static HMENU       g_menuLanguage = nullptr;
+static HMENU       g_menuHelp = nullptr;
 
 static HWND g_grpSource, g_grpTarget, g_grpOptions;
 static HWND g_lblSrcEmu, g_srcEmu;
@@ -61,19 +62,6 @@ static HWND g_backup, g_convert, g_lblLog, g_log;
 static rsc::Lang g_lang = rsc::LANG_EN;
 static float     g_scale = 1.0f;
 
-// ---- dark theme support ---------------------------------------------------------------
-static bool   g_dark = false;        // текущая тема (следует за системной)
-static HFONT  g_menuFont = nullptr;  // шрифт для owner-draw меню
-static HBRUSH g_brWin = nullptr;     // фон окна и меню (тёмный режим)
-static HBRUSH g_brCtrl = nullptr;    // фон полей ввода и списков (тёмный режим)
-static HBRUSH g_brMenuSel = nullptr; // выделение пункта всплывающего меню
-static HBRUSH g_brBarSel = nullptr;  // выделение пункта строки меню
-
-static const COLORREF kDarkBg    = RGB(32, 32, 32);    // фон окна
-static const COLORREF kDarkCtrl  = RGB(43, 43, 43);    // фон контролов
-static const COLORREF kDarkText  = RGB(240, 240, 240); // основной текст
-static const COLORREF kDarkSel   = RGB(0, 120, 215);   // выделение (акцент)
-
 static int SX(int x) { return static_cast<int>(x * g_scale + 0.5f); }
 
 // ========================================================================================
@@ -86,18 +74,31 @@ struct WinEnv : rsc::IEnv {
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) return false;
         bool ok = false;
-        LARGE_INTEGER sz;
+        LARGE_INTEGER sz = {};
         if (GetFileSizeEx(h, &sz) && sz.QuadPart >= 0 &&
             sz.QuadPart < 0x20000000 /* 512 MB sanity cap */) {
-            out.resize(static_cast<size_t>(sz.QuadPart));
-            DWORD rd = 0;
-            if (out.empty()) {
-                ok = true;  // empty file reads as success with zero bytes
-            } else if (ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &rd,
-                                nullptr) &&
-                       rd == out.size()) {
-                ok = true;
+            try {
+                out.resize(static_cast<size_t>(sz.QuadPart));
+            } catch (...) {
+                CloseHandle(h);
+                out.clear();
+                return false;
             }
+
+            size_t offset = 0;
+            ok = true; // an empty file is a successful read with zero bytes
+            while (offset < out.size()) {
+                const size_t remaining = out.size() - offset;
+                const DWORD chunk = remaining > MAXDWORD ? MAXDWORD
+                                                         : static_cast<DWORD>(remaining);
+                DWORD rd = 0;
+                if (!ReadFile(h, out.data() + offset, chunk, &rd, nullptr) || rd == 0) {
+                    ok = false;
+                    break;
+                }
+                offset += rd;
+            }
+            if (offset != out.size()) ok = false;
         }
         CloseHandle(h);
         if (!ok) out.clear();
@@ -105,18 +106,45 @@ struct WinEnv : rsc::IEnv {
     }
 
     bool WriteFileBytes(const std::wstring& path, const uint8_t* data, size_t size) override {
-        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        if (size > 0 && data == nullptr) return false;
+
+        // Write beside the destination, then replace it only after the complete
+        // payload has been flushed. A failed/short write therefore cannot truncate
+        // an existing save file.
+        const size_t slash = path.find_last_of(L"\\/");
+        const std::wstring directory =
+            (slash == std::wstring::npos) ? L".\\" : path.substr(0, slash + 1);
+        wchar_t tempPath[MAX_PATH + 1] = {0};
+        if (!GetTempFileNameW(directory.c_str(), L"RSC", 0, tempPath)) return false;
+
+        HANDLE h = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        DWORD wr = 0;
-        bool ok = true;
-        if (size) {
-            if (!WriteFile(h, data, static_cast<DWORD>(size), &wr, nullptr) ||
-                wr != static_cast<DWORD>(size))
-                ok = false;
+        if (h == INVALID_HANDLE_VALUE) {
+            DeleteFileW(tempPath);
+            return false;
         }
-        CloseHandle(h);
-        return ok;
+
+        bool ok = true;
+        size_t offset = 0;
+        while (offset < size) {
+            const size_t remaining = size - offset;
+            const DWORD chunk = remaining > MAXDWORD ? MAXDWORD
+                                                     : static_cast<DWORD>(remaining);
+            DWORD written = 0;
+            if (!WriteFile(h, data + offset, chunk, &written, nullptr) || written == 0) {
+                ok = false;
+                break;
+            }
+            offset += written;
+        }
+        if (ok && !FlushFileBuffers(h)) ok = false;
+        if (!CloseHandle(h)) ok = false;
+        if (ok && MoveFileExW(tempPath, path.c_str(),
+                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return true;
+
+        DeleteFileW(tempPath);
+        return false;
     }
 
     bool FileExists(const std::wstring& path) override {
@@ -195,407 +223,52 @@ static std::wstring ExeDirW() {
     return (n == std::wstring::npos) ? std::wstring(L".\\") : p.substr(0, n + 1);
 }
 
-// Если рядом с exe писать нельзя (Program Files и т.п.), настройки живут в %APPDATA%.
-static std::wstring AppDataIniW() {
-    wchar_t buf[MAX_PATH + 1] = {0};
-    const DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return std::wstring();
-    const std::wstring dir = std::wstring(buf) + L"\\RetroSaveConverter";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    return dir + L"\\RetroSaveConverter.ini";
+static std::wstring UserConfigIniW() {
+    wchar_t localAppData[MAX_PATH + 1] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE,
+                                   nullptr, SHGFP_TYPE_CURRENT, localAppData))) {
+        std::wstring dir = localAppData;
+        if (!dir.empty() && dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+        dir += L"RetroSaveConverter";
+        if (CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)
+            return dir + L"\\RetroSaveConverter.ini";
+    }
+    return ExeDirW() + L"RetroSaveConverter.ini";
 }
 
-// FIX (баг №4): раньше в INI записывалась строка ("ru"/"en"), а читалось значение
-// как ЧИСЛО (GetPrivateProfileIntW), из-за чего чтение всегда давало 0 и язык
-// сбрасывался на английский. Теперь и запись, и чтение работают со строками
-// (дополнительно понимаются старые числовые значения "1"/"0").
+static bool ReadLangIniValue(const std::wstring& ini, wchar_t* value, DWORD valueCount) {
+    return GetPrivateProfileStringW(L"Settings", L"Language", L"", value,
+                                    valueCount, ini.c_str()) != 0;
+}
+
 static void SaveLangIni() {
-    const wchar_t* val = (g_lang == rsc::LANG_RU) ? L"ru" : L"en";
-    const std::wstring ini = ExeDirW() + L"RetroSaveConverter.ini";
-    if (WritePrivateProfileStringW(L"Settings", L"Language", val, ini.c_str()))
-        return;  // сохранилось рядом с программой
-    const std::wstring ini2 = AppDataIniW();
-    if (!ini2.empty())
-        WritePrivateProfileStringW(L"Settings", L"Language", val, ini2.c_str());
-}
+    const wchar_t* value = (g_lang == rsc::LANG_RU) ? L"ru" : L"en";
+    const std::wstring portableIni = ExeDirW() + L"RetroSaveConverter.ini";
+    if (WritePrivateProfileStringW(L"Settings", L"Language", value,
+                                   portableIni.c_str()))
+        return;
 
-static rsc::Lang ParseLangToken(std::wstring v) {
-    for (auto& c : v) c = static_cast<wchar_t>(towlower(c));
-    if (v == L"ru" || v == L"1" || v == L"russian") return rsc::LANG_RU;
-    return rsc::LANG_EN;
+    const std::wstring userIni = UserConfigIniW();
+    if (userIni != portableIni) {
+        WritePrivateProfileStringW(L"Settings", L"Language", value, userIni.c_str());
+    }
 }
 
 static void LoadLangIni() {
-    wchar_t buf[32] = {0};
-    // 1) INI рядом с программой
-    GetPrivateProfileStringW(L"Settings", L"Language", L"", buf, 32,
-                             (ExeDirW() + L"RetroSaveConverter.ini").c_str());
-    std::wstring v = buf;
-    // 2) резервное расположение в %APPDATA%
-    if (v.empty()) {
-        const std::wstring ini2 = AppDataIniW();
-        if (!ini2.empty())
-            GetPrivateProfileStringW(L"Settings", L"Language", L"", buf, 32, ini2.c_str());
-        v = buf;
-    }
-    g_lang = ParseLangToken(v);
-}
-
-// ========================================================================================
-// Dark theme (Windows 10 1809+ / Windows 11)
-// ========================================================================================
-
-// список всех контролов страницы NES (нужен и для перекраски темы)
-static HWND* const kNesCtrls[] = {
-    &g_grpSource, &g_grpTarget, &g_grpOptions,
-    &g_lblSrcEmu, &g_srcEmu, &g_lblSave, &g_srcFile, &g_btnSrcBrowse,
-    &g_lblRom, &g_romFile, &g_btnRomBrowse,
-    &g_lblType, &g_type,
-    &g_lblTgt, &g_tgtEmu,
-    &g_lblOutDir, &g_outDir, &g_btnOutDirBrowse, &g_lblOutDirHint,
-    &g_backup, &g_convert, &g_lblLog, &g_log,
-};
-
-static bool QueryRegDword(HKEY root, const wchar_t* subkey, const wchar_t* value,
-                          DWORD* out) {
-    HKEY k = nullptr;
-    if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
-    DWORD type = 0, v = 0, size = sizeof(DWORD);
-    const bool ok =
-        RegQueryValueExW(k, value, nullptr, &type, reinterpret_cast<LPBYTE>(&v), &size) ==
-            ERROR_SUCCESS &&
-        type == REG_DWORD;
-    RegCloseKey(k);
-    if (ok) *out = v;
-    return ok;
-}
-
-// Системная тема приложений: AppsUseLightTheme == 0 => тёмная.
-static bool SystemDarkMode() {
-    DWORD light = 1;
-    if (QueryRegDword(HKEY_CURRENT_USER,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                      L"AppsUseLightTheme", &light))
-        return light == 0;
-    return false;
-}
-
-// Тёмный/светлый заголовок окна (DWMWA_USE_IMMERSIVE_DARK_MODE).
-// На Windows 7/8 и сборках ниже 1809 вызов просто не сработает — останется стандартный
-// заголовок, это ожидаемое поведение.
-static void ApplyTitleBarTheme() {
-    if (!g_main) return;
-    static HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
-    if (!dwm) return;
-    typedef HRESULT(WINAPI * FnDswa)(HWND, DWORD, const void*, DWORD);
-    union {                             // корректное приведение FARPROC -> FnDswa
-        FARPROC p;
-        FnDswa f;
-    } cast;
-    cast.p = GetProcAddress(dwm, "DwmSetWindowAttribute");
-    if (!cast.f) return;
-    BOOL v = g_dark ? TRUE : FALSE;
-    if (FAILED(cast.f(g_main, 20, &v, sizeof(v))))   // DWMWA_USE_IMMERSIVE_DARK_MODE
-        cast.f(g_main, 19, &v, sizeof(v));           // то же для 1809/1903
-}
-
-// Тёмная тема контролов. Помимо класса "DarkMode_Explorer" (кнопки, стрелки
-// комбобоксов, полосы прокрутки — поддерживается Windows 10 1809+; на старых
-// системах и в Wine просто не сработает), в тёмном режиме включается собственная
-// отрисовка вкладок, кнопок, групповых рамок и комбобоксов — так тёмный вид
-// остаётся полным и согласованным на любой системе.
-static void SetStyleBit(HWND h, LONG_PTR bit, bool on) {
-    const LONG_PTR st = GetWindowLongW(h, GWL_STYLE);
-    const LONG_PTR ns = on ? (st | bit) : (st & ~bit);
-    if (ns != st) SetWindowLongW(h, GWL_STYLE, ns);
-}
-
-static void ApplyControlThemes() {
-    if (!g_tabs) return;
-    const wchar_t* cls = g_dark ? L"DarkMode_Explorer" : nullptr;
-    SetWindowTheme(g_tabs, cls, nullptr);
-    for (HWND* h : kNesCtrls) {
-        if (!*h) continue;
-        const HWND c = *h;
-        const LONG_PTR st = GetWindowLongW(c, GWL_STYLE);
-        // тип кнопки хранится в младшем полубайте (BS_PUSHBUTTON == 0!)
-        const LONG_PTR btnType = (st & 0x0F);
-        const bool isPushBtn = btnType == BS_PUSHBUTTON || btnType == BS_DEFPUSHBUTTON ||
-                               btnType == BS_GROUPBOX;
-        if (isPushBtn) SetStyleBit(c, BS_OWNERDRAW, g_dark);
-        SetWindowTheme(c, cls, nullptr);
-        InvalidateRect(c, nullptr, TRUE);
-    }
-    if (g_placeholder) SetWindowTheme(g_placeholder, cls, nullptr);
-    InvalidateRect(g_tabs, nullptr, TRUE);
-}
-
-// ---- собственная отрисовка вкладок в тёмной теме ----------------------------------------
-// ВАЖНО: данные вкладок собираются ДО BeginPaint — запросы TCM_* во время
-// отрисовки (реентерабельные SendMessage самому себе) нарушают очередь
-// перерисовки соседних контролов (комбобоксы перестают рисоваться).
-struct DarkTabItem {
-    RECT rc;
-    wchar_t text[64];
-};
-
-static void DrawDarkTabs(HWND, HDC hdc, const DarkTabItem* items, int n, int sel,
-                         const RECT& rcClient, int headerBottom) {
-    FillRect(hdc, &rcClient, g_brWin);  // панель вкладок
-
-    HGDIOBJ oldF = SelectObject(hdc, g_font);
-    SetBkMode(hdc, TRANSPARENT);
-    for (int i = 0; i < n; ++i) {
-        const RECT& it = items[i].rc;
-        const bool selected = (i == sel);
-        FillRect(hdc, &it, selected ? g_brCtrl : g_brWin);
-        if (selected) {  // синяя полоска сверху активной вкладки
-            RECT top = {it.left, it.top, it.right, it.top + 2};
-            FillRect(hdc, &top, g_brMenuSel);
-        }
-        SetTextColor(hdc, selected ? kDarkText : RGB(176, 176, 176));
-        RECT tr = it;
-        tr.left += SX(10);
-        DrawTextW(hdc, items[i].text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-    }
-    if (headerBottom) {  // линия под заголовками вкладок
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
-        HGDIOBJ oldP = SelectObject(hdc, pen);
-        MoveToEx(hdc, rcClient.left, headerBottom, nullptr);
-        LineTo(hdc, rcClient.right, headerBottom);
-        SelectObject(hdc, oldP);
-        DeleteObject(pen);
-    }
-    SelectObject(hdc, oldF);
-}
-
-static LRESULT CALLBACK TabSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
-                                        UINT_PTR, DWORD_PTR) {
-    if (g_dark) {
-        if (msg == WM_PAINT) {
-            // 1) сбор данных — до BeginPaint, без реентерабельных вызовов в отрисовке
-            DarkTabItem items[8];
-            const int n = std::min(TabCtrl_GetItemCount(h), 8);
-            const int sel = TabCtrl_GetCurSel(h);
-            int headerBottom = 0;
-            RECT rcClient;
-            GetClientRect(h, &rcClient);
-            for (int i = 0; i < n; ++i) {
-                ZeroMemory(&items[i], sizeof(items[i]));
-                RECT it = {0, 0, 0, 0};
-                if (TabCtrl_GetItemRect(h, i, &it)) items[i].rc = it;
-                if (items[i].rc.bottom > headerBottom) headerBottom = items[i].rc.bottom;
-                TCITEMW ti;
-                ZeroMemory(&ti, sizeof(ti));
-                ti.mask = TCIF_TEXT;
-                ti.pszText = items[i].text;
-                ti.cchTextMax = 64;
-                TabCtrl_GetItem(h, i, &ti);
-            }
-            // 2) отрисовка
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(h, &ps);
-            DrawDarkTabs(h, hdc, items, n, sel, rcClient, headerBottom);
-            EndPaint(h, &ps);
-            return 0;
-        }
-        if (msg == WM_ERASEBKGND) return 1;  // фон рисуем в WM_PAINT
-    }
-    return DefSubclassProc(h, msg, wp, lp);
-}
-
-// ---- собственная отрисовка кнопок и групповых рамок в тёмной теме -----------------------
-static void DrawDarkButton(DRAWITEMSTRUCT* dis) {
-    const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
-    const bool def = (GetWindowLongW(dis->hwndItem, GWL_STYLE) & BS_DEFPUSHBUTTON) != 0;
-    const RECT r = dis->rcItem;
-    FillRect(dis->hDC, &r, pressed ? g_brBarSel : g_brCtrl);
-    HPEN pen = CreatePen(PS_SOLID, 1, def ? kDarkSel : RGB(104, 104, 104));
-    HGDIOBJ oldP = SelectObject(dis->hDC, pen);
-    HGDIOBJ oldB = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
-    Rectangle(dis->hDC, r.left, r.top, r.right, r.bottom);
-    SelectObject(dis->hDC, oldB);
-    SelectObject(dis->hDC, oldP);
-    DeleteObject(pen);
-
-    wchar_t txt[128] = {0};
-    GetWindowTextW(dis->hwndItem, txt, 128);
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, kDarkText);
-    HGDIOBJ oldF = SelectObject(dis->hDC, g_font);
-    RECT tr = r;
-    tr.left += 4;
-    tr.right -= 4;
-    DrawTextW(dis->hDC, txt, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-    SelectObject(dis->hDC, oldF);
-}
-
-static void DrawDarkGroupBox(DRAWITEMSTRUCT* dis) {
-    const RECT r = dis->rcItem;
-    wchar_t txt[128] = {0};
-    GetWindowTextW(dis->hwndItem, txt, 128);
-
-    HGDIOBJ oldF = SelectObject(dis->hDC, g_font);
-    SIZE sz = {0, 0};
-    if (txt[0]) GetTextExtentPoint32W(dis->hDC, txt, lstrlenW(txt), &sz);
-
-    // рамка (проходит за заголовком)
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(84, 84, 84));
-    HGDIOBJ oldP = SelectObject(dis->hDC, pen);
-    HGDIOBJ oldB = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
-    Rectangle(dis->hDC, r.left, r.top + (sz.cy ? sz.cy / 2 : 5), r.right, r.bottom);
-    SelectObject(dis->hDC, oldB);
-    SelectObject(dis->hDC, oldP);
-    DeleteObject(pen);
-
-    if (txt[0]) {  // заголовок: разрыв в рамке + светлый текст
-        RECT tr = {r.left + SX(9), r.top, r.left + SX(9) + sz.cx + SX(8),
-                   r.top + sz.cy + 1};
-        FillRect(dis->hDC, &tr, g_brWin);
-        SetBkMode(dis->hDC, TRANSPARENT);
-        SetTextColor(dis->hDC, kDarkText);
-        DrawTextW(dis->hDC, txt, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-    }
-    SelectObject(dis->hDC, oldF);
-}
-
-// ---- собственная отрисовка комбобоксов в тёмной теме -----------------------------------
-// Комбобоксы остаются стандартными: фон и цвет текста задаёт WM_CTLCOLORLISTBOX,
-// а чтобы текст выбранного пункта гарантированно был светлым (в Wine и на части
-// сборок Windows он рисуется системным тёмным цветом), он дорисовывается поверх
-// стандартной отрисовки в субклассе ComboSubclassProc.
-static std::vector<std::wstring> g_srcEmuItems, g_tgtEmuItems, g_typeItems;
-
-static LRESULT CALLBACK ComboSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
-                                          UINT_PTR, DWORD_PTR) {
-    const LRESULT res = DefSubclassProc(h, msg, wp, lp);
-    if (g_dark && msg == WM_PAINT && !ComboBox_GetDroppedState(h)) {
-        const std::vector<std::wstring>* items = nullptr;
-        if (h == g_srcEmu)
-            items = &g_srcEmuItems;
-        else if (h == g_type)
-            items = &g_typeItems;
-        else if (h == g_tgtEmu)
-            items = &g_tgtEmuItems;
-        const int sel = ComboBox_GetCurSel(h);
-        const wchar_t* txt =
-            (items && sel != CB_ERR && (size_t)sel < items->size())
-                ? (*items)[(size_t)sel].c_str()
-                : L"";
-        RECT rc;
-        GetClientRect(h, &rc);
-        RECT tr = rc;
-        tr.left += SX(6);
-        tr.right -= GetSystemMetrics(SM_CXVSCROLL) + SX(8);  // не залезаем на стрелку
-        if (tr.right > tr.left) {
-            HDC dc = GetDC(h);
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, kDarkText);
-            HGDIOBJ oldF = SelectObject(dc, g_font);
-            DrawTextW(dc, txt, -1, &tr,
-                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX |
-                          DT_END_ELLIPSIS);
-            SelectObject(dc, oldF);
-            ReleaseDC(h, dc);
+    wchar_t value[16] = {};
+    const std::wstring portableIni = ExeDirW() + L"RetroSaveConverter.ini";
+    bool found = ReadLangIniValue(portableIni, value,
+                                  static_cast<DWORD>(std::size(value)));
+    if (!found) {
+        const std::wstring userIni = UserConfigIniW();
+        if (userIni != portableIni) {
+            found = ReadLangIniValue(userIni, value,
+                                     static_cast<DWORD>(std::size(value)));
         }
     }
-    return res;
-}
-
-// ---- тёмное меню (owner-draw) ----------------------------------------------------------
-struct OdItem {
-    const wchar_t* text;  // указатель на статическую строку из таблицы
-    bool isBar;           // пункт строки меню (true) или всплывающего меню (false)
-};
-static OdItem g_od[] = {
-    {nullptr, true },  // 0: меню "Язык" (bar)
-    {nullptr, true },  // 1: меню "Справка" (bar)
-    {nullptr, false},  // 2: English
-    {nullptr, false},  // 3: Русский
-    {nullptr, false},  // 4: О программе
-};
-
-static void AddMenuItem(HMENU menu, OdItem* od, UINT_PTR idOrSubmenu, bool isPopup) {
-    MENUITEMINFOW mii;
-    ZeroMemory(&mii, sizeof(mii));
-    mii.cbSize = sizeof(mii);
-    if (g_dark) {
-        // owner-draw: рисуем сами (тёмный фон, светлый текст); строка всё равно
-        // хранится в пункте — продолжают работать мнемоники (Alt+буква)
-        mii.fMask = MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STRING;
-        mii.fType = MFT_OWNERDRAW;
-        mii.dwItemData = reinterpret_cast<ULONG_PTR>(od);
-    } else {
-        mii.fMask = MIIM_ID | MIIM_FTYPE | MIIM_STRING;
-        mii.fType = MFT_STRING;
-    }
-    mii.wID = static_cast<UINT>(idOrSubmenu);
-    mii.dwTypeData = const_cast<LPWSTR>(od->text);
-    if (isPopup) {
-        mii.fMask |= MIIM_SUBMENU;
-        mii.hSubMenu = reinterpret_cast<HMENU>(idOrSubmenu);
-    }
-    InsertMenuItemW(menu, UINT_MAX, TRUE, &mii);
-}
-
-// Создаёт строку меню заново с учётом текущего языка и темы.
-// FIX (баг №2): раньше меню собиралось в ApplyLanguage, который вызывался из WM_CREATE,
-// где глобальное g_main ещё не было присвоено — SetMenu(g_main, ...) получал nullptr,
-// и меню не появлялось до первой смены языка. Теперь меню строится отдельно
-// и g_main назначается в самом начале WM_CREATE.
-static void RebuildMenu() {
-    if (!g_main) return;
-
-    g_od[0].text = Str(S_MenuLanguage, g_lang);
-    g_od[1].text = Str(S_MenuHelp, g_lang);
-    g_od[2].text = Str(S_MenuEnglish, g_lang);
-    g_od[3].text = Str(S_MenuRussian, g_lang);
-    g_od[4].text = Str(S_MenuAbout, g_lang);
-
-    HMENU old = GetMenu(g_main);
-    HMENU bar = CreateMenu();
-    HMENU mLang = CreatePopupMenu();
-    HMENU mHelp = CreatePopupMenu();
-
-    AddMenuItem(mLang, &g_od[2], IDM_LANG_EN, false);
-    AddMenuItem(mLang, &g_od[3], IDM_LANG_RU, false);
-    AddMenuItem(mHelp, &g_od[4], IDM_ABOUT, false);
-    AddMenuItem(bar, &g_od[0], reinterpret_cast<UINT_PTR>(mLang), true);
-    AddMenuItem(bar, &g_od[1], reinterpret_cast<UINT_PTR>(mHelp), true);
-
-    CheckMenuRadioItem(mLang, IDM_LANG_EN, IDM_LANG_RU,
-                       IDM_LANG_EN + static_cast<int>(g_lang), MF_BYCOMMAND);
-
-    if (g_dark) {
-        // тёмная подложка строки меню и всплывающих меню
-        MENUINFO mi;
-        ZeroMemory(&mi, sizeof(mi));
-        mi.cbSize = sizeof(mi);
-        mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
-        mi.hbrBack = g_brWin;
-        SetMenuInfo(bar, &mi);
-        SetMenuInfo(mLang, &mi);
-        SetMenuInfo(mHelp, &mi);
-    }
-
-    SetMenu(g_main, bar);
-    if (old) DestroyMenu(old);
-    DrawMenuBar(g_main);
-}
-
-// Перечитывает системную тему и перекрашивает всё живьём — без перезапуска.
-// FIX (баг №3): раньше тёмная тема нигде не отслеживалась и применялась только
-// при следующем запуске. Теперь WM_SETTINGCHANGE (смена темы Windows) обновляет
-// окно сразу: заголовок, фон, контролы и меню.
-static void ApplyThemeAll() {
-    const bool dark = SystemDarkMode();
-    if (dark == g_dark && g_main && GetMenu(g_main)) return;  // тема не менялась
-    g_dark = dark;
-    ApplyTitleBarTheme();
-    ApplyControlThemes();
-    RebuildMenu();
-    RedrawWindow(g_main, nullptr, nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    const std::wstring saved = found ? ToLowerW(value) : L"en";
+    // Accept textual values and legacy numeric values from older INI files.
+    g_lang = (saved == L"ru" || saved == L"1") ? rsc::LANG_RU : rsc::LANG_EN;
 }
 
 // ========================================================================================
@@ -631,6 +304,16 @@ static HWND MkCombo(HWND parent, int id, int x, int y, int w, int h) {
                            nullptr);
 }
 
+static HWND* const kNesCtrls[] = {
+    &g_grpSource, &g_grpTarget, &g_grpOptions,
+    &g_lblSrcEmu, &g_srcEmu, &g_lblSave, &g_srcFile, &g_btnSrcBrowse,
+    &g_lblRom, &g_romFile, &g_btnRomBrowse,
+    &g_lblType, &g_type,
+    &g_lblTgt, &g_tgtEmu,
+    &g_lblOutDir, &g_outDir, &g_btnOutDirBrowse, &g_lblOutDirHint,
+    &g_backup, &g_convert, &g_lblLog, &g_log,
+};
+
 static void ShowNesPage(bool show) {
     for (HWND* h : kNesCtrls)
         if (*h) ShowWindow(*h, show ? SW_SHOW : SW_HIDE);
@@ -640,8 +323,8 @@ static void ShowNesPage(bool show) {
 // Layout
 // ========================================================================================
 static void LayoutAll() {
-    RECT rc;
-    GetClientRect(g_main, &rc);
+    RECT rc = {};
+    if (!g_main || !g_tabs || !GetClientRect(g_main, &rc)) return;
     MoveWindow(g_tabs, 0, 0, rc.right, rc.bottom, TRUE);
 
     RECT disp = rc;
@@ -728,11 +411,6 @@ static void RebuildCombos() {
         Str(S_AutoDetect, g_lang), Str(S_TypeSram, g_lang), Str(S_Type24C01, g_lang),
         Str(S_Type24C02, g_lang), Str(S_TypeDatach, g_lang)};
 
-    // копии строк для дорисовки текста в тёмной теме — см. ComboSubclassProc
-    g_srcEmuItems.assign(emuNames, emuNames + 5);
-    g_tgtEmuItems.assign(tgtNames, tgtNames + 4);
-    g_typeItems.assign(typeNames, typeNames + 5);
-
     int sel;
     sel = ComboBox_GetCurSel(g_srcEmu);
     ComboBox_ResetContent(g_srcEmu);
@@ -748,6 +426,104 @@ static void RebuildCombos() {
     ComboBox_ResetContent(g_type);
     for (int i = 0; i < 5; ++i) ComboBox_AddString(g_type, typeNames[i]);
     ComboBox_SetCurSel(g_type, (sel == CB_ERR || sel < 0) ? 0 : sel);
+}
+
+// ========================================================================================
+// Native menu lifecycle
+// ========================================================================================
+static bool SetMenuLabel(HMENU menu, UINT item, bool byPosition, const wchar_t* text) {
+    if (!menu || !text) return false;
+
+    MENUITEMINFOW info = {};
+    info.cbSize = sizeof(info);
+    info.fMask = MIIM_STRING;
+    info.dwTypeData = const_cast<LPWSTR>(text);
+    info.cch = static_cast<UINT>(lstrlenW(text));
+    return SetMenuItemInfoW(menu, item, byPosition ? TRUE : FALSE, &info) != FALSE;
+}
+
+static bool EnsureMainMenu() {
+    if (!g_main || !IsWindow(g_main)) return false;
+    if (g_menuBar && GetMenu(g_main) == g_menuBar && g_menuLanguage && g_menuHelp)
+        return true;
+
+    // This program has only one top-level window. If it no longer owns the
+    // cached menu, release the stale menu hierarchy before replacing it.
+    if (g_menuBar) {
+        DestroyMenu(g_menuBar); // destroys any attached popup menus as well
+        g_menuBar = nullptr;
+        g_menuLanguage = nullptr;
+        g_menuHelp = nullptr;
+    }
+
+    HMENU bar = CreateMenu();
+    HMENU language = CreatePopupMenu();
+    HMENU help = CreatePopupMenu();
+    if (!bar || !language || !help) {
+        if (bar) DestroyMenu(bar);
+        if (language) DestroyMenu(language);
+        if (help) DestroyMenu(help);
+        return false;
+    }
+
+    const bool languageItemsOk =
+        AppendMenuW(language, MF_STRING, IDM_LANG_EN, L"English") != FALSE &&
+        AppendMenuW(language, MF_STRING, IDM_LANG_RU, L"Русский") != FALSE;
+    const bool helpItemsOk =
+        AppendMenuW(help, MF_STRING, IDM_ABOUT, L"About") != FALSE;
+
+    bool languageAttached = false;
+    bool helpAttached = false;
+    if (languageItemsOk) {
+        languageAttached = AppendMenuW(bar, MF_POPUP,
+                                      reinterpret_cast<UINT_PTR>(language),
+                                      L"Language") != FALSE;
+    }
+    if (helpItemsOk) {
+        helpAttached = AppendMenuW(bar, MF_POPUP,
+                                  reinterpret_cast<UINT_PTR>(help),
+                                  L"Help") != FALSE;
+    }
+
+    if (!languageItemsOk || !helpItemsOk || !languageAttached || !helpAttached ||
+        !SetMenu(g_main, bar)) {
+        // Destroying the bar frees submenus it acquired; separately free only
+        // popup handles that were never transferred to the bar.
+        DestroyMenu(bar);
+        if (language && !languageAttached) DestroyMenu(language);
+        if (help && !helpAttached) DestroyMenu(help);
+        return false;
+    }
+
+    g_menuBar = bar;
+    g_menuLanguage = language;
+    g_menuHelp = help;
+    return true;
+}
+
+static bool UpdateMenuLanguage(rsc::Lang lang) {
+    if (!EnsureMainMenu()) return false;
+
+    bool labelsOk = true;
+    labelsOk &= SetMenuLabel(g_menuBar, 0, true, Str(S_MenuLanguage, lang));
+    labelsOk &= SetMenuLabel(g_menuBar, 1, true, Str(S_MenuHelp, lang));
+    labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_EN, false, Str(S_MenuEnglish, lang));
+    labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_RU, false, Str(S_MenuRussian, lang));
+    labelsOk &= SetMenuLabel(g_menuHelp, IDM_ABOUT, false, Str(S_MenuAbout, lang));
+
+    CheckMenuRadioItem(g_menuLanguage, IDM_LANG_EN, IDM_LANG_RU,
+                       IDM_LANG_EN + static_cast<int>(lang), MF_BYCOMMAND);
+    DrawMenuBar(g_main);
+    return labelsOk;
+}
+
+static void DestroyMainMenu(HWND hwnd) {
+    if (!g_menuBar) return;
+    if (IsWindow(hwnd) && GetMenu(hwnd) == g_menuBar) SetMenu(hwnd, nullptr);
+    DestroyMenu(g_menuBar); // owns the attached language/help submenus
+    g_menuBar = nullptr;
+    g_menuLanguage = nullptr;
+    g_menuHelp = nullptr;
 }
 
 static void ApplyLanguage(rsc::Lang lang, bool saveIni) {
@@ -791,9 +567,15 @@ static void ApplyLanguage(rsc::Lang lang, bool saveIni) {
     SetWindowTextW(g_placeholder, (cur == 2) ? Str(S_ComingSoonN64, lang)
                                              : Str(S_ComingSoonSnes, lang));
 
-    // меню строится отдельно (RebuildMenu) с учётом языка и текущей темы
-    RebuildMenu();
+    // Keep native menu handles stable. Recreating a menu on every language
+    // change creates unnecessary ownership risk and can leave a stale menu
+    // attached if SetMenu fails.
+    UpdateMenuLanguage(lang);
 
+    if (g_main) {
+        RedrawWindow(g_main, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
     if (saveIni) SaveLangIni();
 }
 
@@ -888,7 +670,9 @@ static void OnConvert() {
     sel = ComboBox_GetCurSel(g_tgtEmu);
     static const Emu tgtMap[4] = {Emu::MesenCE, Emu::Nestopia, Emu::Nintendulator,
                                   Emu::Raw};
-    req.target = (sel == CB_ERR) ? Emu::Nestopia : tgtMap[sel];
+    req.target = (sel >= 0 && sel < static_cast<int>(sizeof(tgtMap) / sizeof(tgtMap[0])))
+                     ? tgtMap[sel]
+                     : Emu::Nestopia;
     req.outputDir = GetEditText(g_outDir);
     req.backup = (SendMessageW(g_backup, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
@@ -942,16 +726,18 @@ static void OnConvert() {
 // Drag & drop
 // ========================================================================================
 static void OnDropFiles(HDROP hd) {
-    wchar_t buf[1024] = {0};
-    const UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
-    if (n == 0) {
+    const UINT count = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+    if (count == 0) {
         DragFinish(hd);
         return;
     }
-    DragQueryFileW(hd, 0, buf, 1024);
-    DragFinish(hd);
 
-    const std::wstring path = buf;
+    const UINT pathLength = DragQueryFileW(hd, 0, nullptr, 0);
+    std::wstring path(static_cast<size_t>(pathLength) + 1, L'\0');
+    const UINT copied = DragQueryFileW(hd, 0, &path[0], pathLength + 1);
+    DragFinish(hd);
+    if (copied == 0) return;
+    path.resize(copied);
     const std::wstring ext = GetExtOf(path);
     if (ext == L".nes" || ext == L".unf") {
         SetWindowTextW(g_romFile, path.c_str());
@@ -967,36 +753,44 @@ static void OnDropFiles(HDROP hd) {
 }
 
 // ========================================================================================
+// Theme refresh
+// ========================================================================================
+static void RefreshWindowPainting(HWND hwnd) {
+    if (!IsWindow(hwnd)) return;
+    DrawMenuBar(hwnd);
+    RedrawWindow(hwnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+// ========================================================================================
 // Window procedure
 // ========================================================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_NCCREATE:
+            // WM_CREATE is sent from inside CreateWindowExW, before that function
+            // returns. Set the global handle here so initial menu/layout work uses
+            // the real window rather than nullptr.
+            g_main = hwnd;
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         case WM_CREATE: {
             CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
 
-            // FIX (баг №2): g_main должен быть валиден до вызова ApplyLanguage —
-            // раньше он присваивался только после возврата CreateWindowExW, поэтому
-            // SetMenu(g_main, ...) внутри WM_CREATE получал nullptr, и меню
-            // отсутствовало до первой смены языка.
-            g_main = hwnd;
+            // DPI scale
+            HDC dc = GetDC(hwnd);
+            if (dc) {
+                const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+                if (dpi > 0) g_scale = dpi / 96.0f;
+                ReleaseDC(hwnd, dc);
+            }
+            if (g_scale < 1.0f) g_scale = 1.0f;
 
-            // тема узнаётся ДО создания контролов: комбобоксы в тёмной теме
-            // создаются сразу с owner-draw стилем (сменить его потом нельзя)
-            g_dark = SystemDarkMode();
-
-            // message font + menu font (для owner-draw меню)
+            // message font
             NONCLIENTMETRICSW ncm;
             ZeroMemory(&ncm, sizeof(ncm));
             ncm.cbSize = sizeof(ncm);
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             g_font = CreateFontIndirectW(&ncm.lfMessageFont);
-            g_menuFont = CreateFontIndirectW(&ncm.lfMenuFont);
-
-            // кисти тёмной темы
-            g_brWin = CreateSolidBrush(kDarkBg);
-            g_brCtrl = CreateSolidBrush(kDarkCtrl);
-            g_brMenuSel = CreateSolidBrush(kDarkSel);
-            g_brBarSel = CreateSolidBrush(RGB(64, 64, 64));
 
             // tabs
             g_tabs = CreateWindowExW(0, WC_TABCONTROLW, L"",
@@ -1006,8 +800,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                      reinterpret_cast<HMENU>(
                                          static_cast<INT_PTR>(IDC_TABS)),
                                      g_hInst, nullptr);
-            // в тёмной теме вкладки рисуем сами (согласованный тёмный вид)
-            SetWindowSubclass(g_tabs, TabSubclassProc, 1, 0);
 
             const int lx = SX(140), lh = SX(26);
             // NES page controls (positions set in LayoutAll)
@@ -1049,21 +841,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_placeholder = MkStatic(hwnd, IDC_PLACEHOLDER, SS_CENTER | WS_BORDER, 0, 0,
                                      10, 10);
 
-            // дорисовка светлого текста в комбобоксах (тёмная тема)
-            SetWindowSubclass(g_srcEmu, ComboSubclassProc, 1, 0);
-            SetWindowSubclass(g_type, ComboSubclassProc, 1, 0);
-            SetWindowSubclass(g_tgtEmu, ComboSubclassProc, 1, 0);
-
-    // tab captions are set by ApplyLanguage; insert the three pages first
-    TCITEMW ti;
-    ZeroMemory(&ti, sizeof(ti));
-    ti.mask = TCIF_TEXT;
-    ti.pszText = const_cast<LPWSTR>(L"NES / FC");
-    TabCtrl_InsertItem(g_tabs, 0, &ti);
-    ti.pszText = const_cast<LPWSTR>(L"SNES / SFC");
-    TabCtrl_InsertItem(g_tabs, 1, &ti);
-    ti.pszText = const_cast<LPWSTR>(L"N64");
-    TabCtrl_InsertItem(g_tabs, 2, &ti);
+            // Insert the three pages before ApplyLanguage sets localized captions.
+            TCITEMW ti = {};
+            ti.mask = TCIF_TEXT;
+            ti.pszText = const_cast<LPWSTR>(L"NES / FC");
+            TabCtrl_InsertItem(g_tabs, 0, &ti);
+            ti.pszText = const_cast<LPWSTR>(L"SNES / SFC");
+            TabCtrl_InsertItem(g_tabs, 1, &ti);
+            ti.pszText = const_cast<LPWSTR>(L"N64");
+            TabCtrl_InsertItem(g_tabs, 2, &ti);
 
             // default states
             SendMessageW(g_backup, BM_SETCHECK, BST_CHECKED, 0);
@@ -1076,15 +862,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(g_placeholder, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
             LoadLangIni();
-            ApplyLanguage(g_lang, false);  // тексты, комбобоксы, меню
-            ApplyTitleBarTheme();          // тёмный заголовок (DWM)
-            ApplyControlThemes();          // тёмные контролы (DarkMode_Explorer)
+            ApplyLanguage(g_lang, false);
             LayoutAll();
             ShowNesPage(true);
             ShowWindow(g_placeholder, SW_HIDE);
 
             DragAcceptFiles(hwnd, TRUE);
             return 0;
+        }
+
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_SETTINGCHANGE: {
+            // Let Windows update themed controls first, then repaint the complete
+            // child tree. This avoids stale/light fragments after an OS theme or
+            // system-colour change while the application is running.
+            const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (hwnd == g_main) RefreshWindowPainting(hwnd);
+            return result;
         }
 
         case WM_SIZE:
@@ -1114,136 +909,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_DROPFILES:
             OnDropFiles(reinterpret_cast<HDROP>(wParam));
             return 0;
-
-        // ---- тёмная тема: фон окна -------------------------------------------
-        case WM_ERASEBKGND: {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            FillRect(dc, &rc, g_dark ? g_brWin : GetSysColorBrush(COLOR_BTNFACE));
-            return 1;
-        }
-
-        // ---- тёмная тема: цвета контролов ------------------------------------
-        case WM_CTLCOLORSTATIC:
-        case WM_CTLCOLORBTN: {
-            if (!g_dark)
-                return DefWindowProcW(hwnd, msg, wParam, lParam);
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            const HWND ctrl = reinterpret_cast<HWND>(lParam);
-            if (ctrl == g_log) {
-                // журнал — только читается: рисуем как тёмное поле ввода
-                SetBkColor(dc, kDarkCtrl);
-                SetTextColor(dc, kDarkText);
-                return reinterpret_cast<LRESULT>(g_brCtrl);
-            }
-            // метки, групповые рамки, чекбокс, панель вкладок
-            SetBkColor(dc, kDarkBg);
-            SetTextColor(dc, kDarkText);
-            return reinterpret_cast<LRESULT>(g_brWin);
-        }
-
-        case WM_CTLCOLOREDIT: {
-            if (!g_dark) return DefWindowProcW(hwnd, msg, wParam, lParam);
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetBkColor(dc, kDarkCtrl);
-            SetTextColor(dc, kDarkText);
-            return reinterpret_cast<LRESULT>(g_brCtrl);
-        }
-
-        case WM_CTLCOLORLISTBOX: {
-            if (!g_dark) return DefWindowProcW(hwnd, msg, wParam, lParam);
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetBkColor(dc, kDarkCtrl);
-            SetTextColor(dc, kDarkText);
-            return reinterpret_cast<LRESULT>(g_brCtrl);
-        }
-
-        // ---- owner-draw: меню и кнопки (тёмная тема) -----------------------------
-        case WM_MEASUREITEM: {
-            MEASUREITEMSTRUCT* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-            if (mis->CtlType != ODT_MENU)
-                return DefWindowProcW(hwnd, msg, wParam, lParam);
-            const OdItem* od = reinterpret_cast<const OdItem*>(mis->itemData);
-            if (!od || !od->text) return DefWindowProcW(hwnd, msg, wParam, lParam);
-            HDC dc = GetDC(hwnd);
-            HGDIOBJ oldF = SelectObject(dc, g_menuFont);
-            SIZE sz = {0, 0};
-            GetTextExtentPoint32W(dc, od->text, lstrlenW(od->text), &sz);
-            SelectObject(dc, oldF);
-            ReleaseDC(hwnd, dc);
-            if (od->isBar) {
-                mis->itemWidth = sz.cx + SX(16);
-                mis->itemHeight = GetSystemMetrics(SM_CYMENU);
-            } else {
-                mis->itemWidth = sz.cx + SX(38);   // текст + маркер выбора + отступы
-                mis->itemHeight = std::max<int>(sz.cy, GetSystemMetrics(SM_CYMENU) - 4) +
-                                  SX(6);
-            }
-            return TRUE;
-        }
-
-        case WM_DRAWITEM: {
-            DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-            if (dis->CtlType == ODT_MENU) {
-                const OdItem* od = reinterpret_cast<const OdItem*>(dis->itemData);
-                if (!od || !od->text) return DefWindowProcW(hwnd, msg, wParam, lParam);
-                const bool sel = (dis->itemState & ODS_SELECTED) != 0;
-                const int saveDC = SaveDC(dis->hDC);
-                if (od->isBar) {
-                    FillRect(dis->hDC, &dis->rcItem, sel ? g_brBarSel : g_brWin);
-                    SetTextColor(dis->hDC, kDarkText);
-                } else {
-                    FillRect(dis->hDC, &dis->rcItem, sel ? g_brMenuSel : g_brWin);
-                    SetTextColor(dis->hDC, sel ? RGB(255, 255, 255) : kDarkText);
-                }
-                SetBkMode(dis->hDC, TRANSPARENT);
-                HGDIOBJ oldF = SelectObject(dis->hDC, g_menuFont);
-                RECT rc = dis->rcItem;
-                rc.left += od->isBar ? SX(8) : SX(26);   // место под маркер выбора
-                // без DT_NOPREFIX: DrawTextW сам скроет & и подчеркнёт букву-мнемонику
-                DrawTextW(dis->hDC, od->text, -1, &rc,
-                          DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-                SelectObject(dis->hDC, oldF);
-                if (!od->isBar && (dis->itemState & ODS_CHECKED)) {
-                    // маркер-точка активного языка (радиокнопка)
-                    const int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
-                    const int cx = dis->rcItem.left + SX(12);
-                    const COLORREF mark = sel ? RGB(255, 255, 255) : kDarkText;
-                    HPEN pen = CreatePen(PS_SOLID, 1, mark);
-                    HBRUSH br = CreateSolidBrush(mark);
-                    HGDIOBJ oldP = SelectObject(dis->hDC, pen);
-                    HGDIOBJ oldB = SelectObject(dis->hDC, br);
-                    Ellipse(dis->hDC, cx - SX(4), cy - SX(4), cx + SX(4), cy + SX(4));
-                    SelectObject(dis->hDC, oldB);
-                    SelectObject(dis->hDC, oldP);
-                    DeleteObject(pen);
-                    DeleteObject(br);
-                }
-                RestoreDC(dis->hDC, saveDC);
-                return TRUE;
-            }
-            if (dis->CtlType == ODT_BUTTON) {
-                if (GetWindowLongW(dis->hwndItem, GWL_STYLE) & BS_GROUPBOX)
-                    DrawDarkGroupBox(dis);
-                else
-                    DrawDarkButton(dis);
-                return TRUE;
-            }
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-        }
-
-        // ---- живая смена темы Windows (без перезапуска) -----------------------
-        case WM_SETTINGCHANGE:
-            if (wParam == 0 && lParam != 0 &&
-                wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"ImmersiveColorSet") == 0)
-                ApplyThemeAll();
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        case WM_THEMECHANGED:
-            // смена визуального стиля сбрасывает темы контролов — применяем заново
-            ApplyControlThemes();
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
 
         case WM_COMMAND: {
             const int id = LOWORD(wParam);
@@ -1296,14 +961,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_DESTROY:
-            if (g_font) DeleteObject(g_font);
-            if (g_menuFont) DeleteObject(g_menuFont);
-            if (g_brWin) DeleteObject(g_brWin);
-            if (g_brCtrl) DeleteObject(g_brCtrl);
-            if (g_brMenuSel) DeleteObject(g_brMenuSel);
-            if (g_brBarSel) DeleteObject(g_brBarSel);
             PostQuitMessage(0);
             return 0;
+
+        case WM_NCDESTROY: {
+            if (hwnd == g_main) DestroyMainMenu(hwnd);
+            const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (g_font) {
+                DeleteObject(g_font);
+                g_font = nullptr;
+            }
+            if (g_main == hwnd) g_main = nullptr;
+            return result;
+        }
 
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1316,20 +986,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hInst = hInstance;
 
-    // FIX (отображение при высоком DPI): масштаб вычисляется ДО создания окна.
-    // Раньше он считался только в WM_CREATE — то есть уже после того, как размер
-    // окна рассчитан по SX() с ещё не обновлённым g_scale (всегда 1.0), из-за чего
-    // при масштабе 125–200% контролы вылезали за пределы окна.
-    HDC dc0 = GetDC(nullptr);
-    g_scale = GetDeviceCaps(dc0, LOGPIXELSX) / 96.0f;
-    ReleaseDC(nullptr, dc0);
-    if (g_scale < 1.0f) g_scale = 1.0f;
-
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
-    InitCommonControlsEx(&icc);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (!InitCommonControlsEx(&icc)) return 1;
+
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool comInitialized = SUCCEEDED(comResult);
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -1338,35 +1001,60 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(2));
-    wc.hIconSm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(2), IMAGE_ICON,
-                                   GetSystemMetrics(SM_CXSMICON),
-                                   GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    wc.hIconSm = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(2), IMAGE_ICON,
+                                               GetSystemMetrics(SM_CXSMICON),
+                                               GetSystemMetrics(SM_CYSMICON),
+                                               LR_DEFAULTCOLOR));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"RetroSaveConverterWnd";
-    RegisterClassExW(&wc);
 
-    const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX;
+    if (!RegisterClassExW(&wc)) {
+        if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+        if (comInitialized) CoUninitialize();
+        return 1;
+    }
+
+    // Establish scale before calculating the initial outer window size. With
+    // DPI awareness enabled in the manifest, initializing it only in WM_CREATE
+    // makes the first window too small on high-DPI displays.
+    HDC desktopDc = GetDC(nullptr);
+    if (desktopDc) {
+        const int dpi = GetDeviceCaps(desktopDc, LOGPIXELSX);
+        if (dpi > 0) g_scale = dpi / 96.0f;
+        ReleaseDC(nullptr, desktopDc);
+    }
+    if (g_scale < 1.0f) g_scale = 1.0f;
+
     const int W = SX(560), H = SX(590);
     RECT adj = {0, 0, W, H};
-    AdjustWindowRect(&adj, style, TRUE);
+    AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
 
     g_main = CreateWindowExW(0, L"RetroSaveConverterWnd", L"Retro Save Converter",
-                             style, CW_USEDEFAULT, CW_USEDEFAULT,
-                             adj.right - adj.left, adj.bottom - adj.top,
+                             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, CW_USEDEFAULT,
+                             CW_USEDEFAULT, adj.right - adj.left, adj.bottom - adj.top,
                              nullptr, nullptr, hInstance, nullptr);
-    if (!g_main) return 1;
+    if (!g_main) {
+        UnregisterClassW(wc.lpszClassName, hInstance);
+        if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+        if (comInitialized) CoUninitialize();
+        return 1;
+    }
 
     ShowWindow(g_main, nCmdShow);
     UpdateWindow(g_main);
 
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
+    MSG msg = {};
+    BOOL messageResult = 0;
+    while ((messageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         if (!IsDialogMessageW(g_main, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
 
-    CoUninitialize();
-    return static_cast<int>(msg.wParam);
+    const int exitCode = (messageResult == -1) ? 1 : static_cast<int>(msg.wParam);
+    UnregisterClassW(wc.lpszClassName, hInstance);
+    if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+    if (comInitialized) CoUninitialize();
+    return exitCode;
 }
