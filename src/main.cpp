@@ -47,6 +47,7 @@ static HWND        g_main    = nullptr;
 static HWND        g_tabs    = nullptr;
 static HWND        g_placeholder = nullptr;   // SNES/N64 "coming soon" label
 static HFONT       g_font    = nullptr;
+static HFONT       g_fontStrong = nullptr;
 static HMENU       g_menuBar = nullptr;
 static HMENU       g_menuLanguage = nullptr;
 static HMENU       g_menuView = nullptr;
@@ -64,35 +65,62 @@ static HWND g_backup, g_convert, g_lblLog, g_log;
 static rsc::Lang g_lang = rsc::LANG_EN;
 static bool      g_darkTheme = false;
 static HBRUSH    g_brushWindow = nullptr;
-static HBRUSH    g_brushSurface = nullptr;
 static HBRUSH    g_brushEdit = nullptr;
 static float     g_scale = 1.0f;
 
 static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
                                          LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
 
-static COLORREF ThemeWindowColor() { return g_darkTheme ? RGB(30, 32, 35) : GetSysColor(COLOR_BTNFACE); }
-static COLORREF ThemeSurfaceColor() { return g_darkTheme ? RGB(40, 43, 47) : GetSysColor(COLOR_BTNFACE); }
-static COLORREF ThemeEditColor() { return g_darkTheme ? RGB(24, 26, 29) : GetSysColor(COLOR_WINDOW); }
-static COLORREF ThemeTextColor() { return g_darkTheme ? RGB(232, 234, 237) : GetSysColor(COLOR_WINDOWTEXT); }
-static COLORREF ThemeMutedTextColor() { return g_darkTheme ? RGB(190, 194, 200) : GetSysColor(COLOR_GRAYTEXT); }
+// A restrained modern palette. Custom-drawn controls use these colours in both
+// themes; native edit/combo controls remain native for accessibility and keyboard support.
+static COLORREF ThemeWindowColor()      { return g_darkTheme ? RGB(27, 30, 35) : RGB(246, 248, 251); }
+static COLORREF ThemeSurfaceColor()     { return g_darkTheme ? RGB(36, 40, 46) : RGB(255, 255, 255); }
+static COLORREF ThemeEditColor()        { return g_darkTheme ? RGB(29, 32, 37) : RGB(255, 255, 255); }
+static COLORREF ThemeTextColor()        { return g_darkTheme ? RGB(233, 236, 241) : RGB(35, 42, 52); }
+static COLORREF ThemeMutedTextColor()   { return g_darkTheme ? RGB(169, 176, 186) : RGB(100, 110, 123); }
+static COLORREF ThemeBorderColor()      { return g_darkTheme ? RGB(65, 72, 82) : RGB(218, 224, 232); }
+static COLORREF ThemeControlHoverColor(){ return g_darkTheme ? RGB(49, 54, 62) : RGB(239, 243, 249); }
+static COLORREF ThemeControlDownColor() { return g_darkTheme ? RGB(57, 63, 72) : RGB(229, 235, 244); }
+static COLORREF ThemeAccentColor()      { return g_darkTheme ? RGB(76, 133, 242) : RGB(45, 105, 230); }
+static COLORREF ThemeAccentHoverColor() { return g_darkTheme ? RGB(94, 148, 250) : RGB(36, 91, 210); }
+static COLORREF ThemeAccentDownColor()  { return g_darkTheme ? RGB(62, 115, 220) : RGB(29, 78, 190); }
+static COLORREF ThemeAccentTextColor()  { return RGB(255, 255, 255); }
 
 static void RecreateThemeBrushes() {
     if (g_brushWindow) { DeleteObject(g_brushWindow); g_brushWindow = nullptr; }
-    if (g_brushSurface) { DeleteObject(g_brushSurface); g_brushSurface = nullptr; }
     if (g_brushEdit) { DeleteObject(g_brushEdit); g_brushEdit = nullptr; }
-    if (g_darkTheme) {
-        g_brushWindow = CreateSolidBrush(ThemeWindowColor());
-        g_brushSurface = CreateSolidBrush(ThemeSurfaceColor());
-        g_brushEdit = CreateSolidBrush(ThemeEditColor());
-    }
+    // Keep app-owned brushes in light as well as dark mode so the UI never falls
+    // back to the raised, system-grey Win9x button face between repaints.
+    g_brushWindow = CreateSolidBrush(ThemeWindowColor());
+    g_brushEdit = CreateSolidBrush(ThemeEditColor());
 }
 
-static HBRUSH ThemeWindowBrush() { return g_darkTheme && g_brushWindow ? g_brushWindow : GetSysColorBrush(COLOR_BTNFACE); }
-static HBRUSH ThemeSurfaceBrush() { return g_darkTheme && g_brushSurface ? g_brushSurface : GetSysColorBrush(COLOR_BTNFACE); }
-static HBRUSH ThemeEditBrush() { return g_darkTheme && g_brushEdit ? g_brushEdit : GetSysColorBrush(COLOR_WINDOW); }
+static HBRUSH ThemeWindowBrush() {
+    return g_brushWindow ? g_brushWindow : GetSysColorBrush(COLOR_BTNFACE);
+}
+static HBRUSH ThemeEditBrush() {
+    return g_brushEdit ? g_brushEdit : GetSysColorBrush(COLOR_WINDOW);
+}
 
 static int SX(int x) { return static_cast<int>(x * g_scale + 0.5f); }
+
+static void DrawRoundedSurface(HDC dc, const RECT& rc, COLORREF fillColor,
+                               COLORREF borderColor, int radius) {
+    HBRUSH brush = CreateSolidBrush(fillColor);
+    HPEN pen = CreatePen(PS_SOLID, (SX(1) > 0 ? SX(1) : 1), borderColor);
+    if (!brush || !pen) {
+        if (brush) DeleteObject(brush);
+        if (pen) DeleteObject(pen);
+        return;
+    }
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, SX(radius), SX(radius));
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
 
 // ========================================================================================
 // Win32 implementation of the engine's filesystem interface
@@ -322,12 +350,13 @@ static HWND MkStatic(HWND parent, int id, DWORD style, int x, int y, int w, int 
 }
 
 static HWND MkButton(HWND parent, int id, DWORD style, int x, int y, int w, int h) {
-    // Owner-draw push buttons so their fill/text colours remain coherent in both
-    // themes. Group boxes and check boxes keep native styles.
+    // Custom-draw push buttons and group panels use the same flat, rounded theme.
+    // Checkboxes stay native so their keyboard and accessibility behavior is retained.
     const DWORD type = style & BS_TYPEMASK;
-    if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON)
-        style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW;
-    const DWORD tabStop = ((style & BS_TYPEMASK) == BS_GROUPBOX) ? 0 : WS_TABSTOP;
+    const bool groupBox = type == BS_GROUPBOX;
+    const bool pushButton = type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON;
+    if (groupBox || pushButton) style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW;
+    const DWORD tabStop = groupBox ? 0 : WS_TABSTOP;
     return CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | tabStop | style,
                            x, y, w, h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
@@ -339,9 +368,14 @@ static bool IsOwnerDrawPushButton(HWND control) {
                        control == g_btnOutDirBrowse || control == g_convert);
 }
 
+static bool IsOwnerDrawGroupBox(HWND control) {
+    return control && (control == g_grpSource || control == g_grpTarget ||
+                       control == g_grpOptions);
+}
+
 static HWND MkEdit(HWND parent, int id, int x, int y, int w, int h) {
-    return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, x, y, w,
+    return CreateWindowExW(0, L"EDIT", L"",
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, x, y, w,
                            h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
                            nullptr);
@@ -450,34 +484,74 @@ static void LayoutAll() {
 // ========================================================================================
 // Language handling
 // ========================================================================================
+static Emu GetComboEmu(HWND combo, Emu fallback) {
+    if (!combo) return fallback;
+    const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (selection == CB_ERR) return fallback;
+    const LRESULT data = SendMessageW(combo, CB_GETITEMDATA, static_cast<WPARAM>(selection), 0);
+    if (data == CB_ERR) return fallback;
+    return static_cast<Emu>(static_cast<int>(data));
+}
+
+static void SetComboEmu(HWND combo, Emu emu) {
+    if (!combo) return;
+    const LRESULT count = SendMessageW(combo, CB_GETCOUNT, 0, 0);
+    for (LRESULT i = 0; i < count; ++i) {
+        const LRESULT data = SendMessageW(combo, CB_GETITEMDATA, static_cast<WPARAM>(i), 0);
+        if (data != CB_ERR && static_cast<Emu>(static_cast<int>(data)) == emu) {
+            SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(i), 0);
+            return;
+        }
+    }
+}
+
+static void AddEmuChoice(HWND combo, Emu emu, const wchar_t* name) {
+    const LRESULT index = SendMessageW(combo, CB_ADDSTRING, 0,
+                                       reinterpret_cast<LPARAM>(name));
+    if (index != CB_ERR && index != CB_ERRSPACE)
+        SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(index),
+                     static_cast<LPARAM>(static_cast<int>(emu)));
+}
+
 static void RebuildCombos() {
-    // source emulator combo: index matches rsc::Emu exactly
-    // Source combo order follows rsc::Emu for safe index-to-enum conversion.
-    const wchar_t* emuNames[8] = {Str(S_AutoDetect, g_lang), L"MesenCE", L"Nestopia",
-                                  L"Nintendulator", Str(S_GenericSav, g_lang), L"FCEUX",
-                                  L"puNES", L"ares (NES)"};
-    const wchar_t* tgtNames[7] = {L"MesenCE", L"Nestopia", L"Nintendulator",
-                                  Str(S_GenericSav, g_lang), L"FCEUX", L"puNES", L"ares (NES)"};
-    // content type combo: index matches rsc::SaveType exactly
+    // Auto-detect is a command rather than an emulator, so it remains pinned first.
+    // Actual emulator entries are alphabetized identically in source and target lists.
+    // Item data (not row number) carries the enum: changing presentation order can
+    // therefore never change which emulator is selected for conversion.
+    const Emu sourceSelection = GetComboEmu(g_srcEmu, Emu::Auto);
+    const Emu targetSelection = GetComboEmu(g_tgtEmu, Emu::Nestopia);
+    const int typeSelection = ComboBox_GetCurSel(g_type);
+
+    ComboBox_ResetContent(g_srcEmu);
+    AddEmuChoice(g_srcEmu, Emu::Auto, Str(S_AutoDetect, g_lang));
+    AddEmuChoice(g_srcEmu, Emu::Ares, L"ares (NES)");
+    AddEmuChoice(g_srcEmu, Emu::FCEUX, L"FCEUX");
+    if (g_lang == LANG_EN) AddEmuChoice(g_srcEmu, Emu::Raw, Str(S_GenericSav, g_lang));
+    AddEmuChoice(g_srcEmu, Emu::MesenCE, L"MesenCE");
+    AddEmuChoice(g_srcEmu, Emu::Nestopia, L"Nestopia");
+    AddEmuChoice(g_srcEmu, Emu::Nintendulator, L"Nintendulator");
+    AddEmuChoice(g_srcEmu, Emu::PuNES, L"puNES");
+    if (g_lang == LANG_RU) AddEmuChoice(g_srcEmu, Emu::Raw, Str(S_GenericSav, g_lang));
+    SetComboEmu(g_srcEmu, sourceSelection);
+
+    ComboBox_ResetContent(g_tgtEmu);
+    AddEmuChoice(g_tgtEmu, Emu::Ares, L"ares (NES)");
+    AddEmuChoice(g_tgtEmu, Emu::FCEUX, L"FCEUX");
+    if (g_lang == LANG_EN) AddEmuChoice(g_tgtEmu, Emu::Raw, Str(S_GenericSav, g_lang));
+    AddEmuChoice(g_tgtEmu, Emu::MesenCE, L"MesenCE");
+    AddEmuChoice(g_tgtEmu, Emu::Nestopia, L"Nestopia");
+    AddEmuChoice(g_tgtEmu, Emu::Nintendulator, L"Nintendulator");
+    AddEmuChoice(g_tgtEmu, Emu::PuNES, L"puNES");
+    if (g_lang == LANG_RU) AddEmuChoice(g_tgtEmu, Emu::Raw, Str(S_GenericSav, g_lang));
+    SetComboEmu(g_tgtEmu, targetSelection);
+
+    // Save-data kinds keep their semantic order (Auto, SRAM, EEPROM variants).
     const wchar_t* typeNames[5] = {
         Str(S_AutoDetect, g_lang), Str(S_TypeSram, g_lang), Str(S_Type24C01, g_lang),
         Str(S_Type24C02, g_lang), Str(S_TypeDatach, g_lang)};
-
-    int sel;
-    sel = ComboBox_GetCurSel(g_srcEmu);
-    ComboBox_ResetContent(g_srcEmu);
-    for (int i = 0; i < 8; ++i) ComboBox_AddString(g_srcEmu, emuNames[i]);
-    ComboBox_SetCurSel(g_srcEmu, (sel == CB_ERR || sel < 0) ? 0 : sel);
-
-    sel = ComboBox_GetCurSel(g_tgtEmu);
-    ComboBox_ResetContent(g_tgtEmu);
-    for (int i = 0; i < 7; ++i) ComboBox_AddString(g_tgtEmu, tgtNames[i]);
-    ComboBox_SetCurSel(g_tgtEmu, (sel == CB_ERR || sel < 0) ? 1 : sel);
-
-    sel = ComboBox_GetCurSel(g_type);
     ComboBox_ResetContent(g_type);
     for (int i = 0; i < 5; ++i) ComboBox_AddString(g_type, typeNames[i]);
-    ComboBox_SetCurSel(g_type, (sel == CB_ERR || sel < 0) ? 0 : sel);
+    ComboBox_SetCurSel(g_type, (typeSelection == CB_ERR || typeSelection < 0) ? 0 : typeSelection);
 }
 
 // ========================================================================================
@@ -592,8 +666,8 @@ static void RefreshWindowPainting(HWND hwnd) {
 
 static void ApplyControlTheme(HWND control) {
     if (!control || !IsWindow(control)) return;
-    // Classic Win32 controls honour WM_CTLCOLOR*, enabling a consistent fallback
-    // on Windows versions that do not expose a public dark-mode control API.
+    // Native edits and combo boxes retain their OS interaction/keyboard behavior;
+    // owner-drawn controls and the parent use the app palette for a consistent look.
     SetWindowTheme(control, g_darkTheme ? L"" : nullptr, g_darkTheme ? L"" : nullptr);
     InvalidateRect(control, nullptr, TRUE);
 }
@@ -772,16 +846,10 @@ static void OnConvert() {
         req.rom = ParseNesHeader(romBytes.data(), romBytes.size());
     }
 
-    int sel = ComboBox_GetCurSel(g_srcEmu);
-    req.sourceFormat = (sel == CB_ERR) ? Emu::Auto : static_cast<Emu>(sel);
-    sel = ComboBox_GetCurSel(g_type);
-    req.saveType = (sel == CB_ERR) ? SaveType::Auto : static_cast<SaveType>(sel);
-    sel = ComboBox_GetCurSel(g_tgtEmu);
-    static const Emu tgtMap[7] = {Emu::MesenCE, Emu::Nestopia, Emu::Nintendulator,
-                                  Emu::Raw, Emu::FCEUX, Emu::PuNES, Emu::Ares};
-    req.target = (sel >= 0 && sel < static_cast<int>(sizeof(tgtMap) / sizeof(tgtMap[0])))
-                     ? tgtMap[sel]
-                     : Emu::Nestopia;
+    req.sourceFormat = GetComboEmu(g_srcEmu, Emu::Auto);
+    const int typeSel = ComboBox_GetCurSel(g_type);
+    req.saveType = (typeSel == CB_ERR) ? SaveType::Auto : static_cast<SaveType>(typeSel);
+    req.target = GetComboEmu(g_tgtEmu, Emu::Nestopia);
     req.outputDir = GetEditText(g_outDir);
     req.backup = (SendMessageW(g_backup, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
@@ -864,7 +932,7 @@ static void OnDropFiles(HDROP hd) {
 
 static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
                                          LPARAM lParam, UINT_PTR, DWORD_PTR) {
-    if (msg == WM_ERASEBKGND && g_darkTheme) {
+    if (msg == WM_ERASEBKGND) {
         RECT rc = {};
         GetClientRect(hwnd, &rc);
         FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeWindowBrush());
@@ -901,7 +969,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ZeroMemory(&ncm, sizeof(ncm));
             ncm.cbSize = sizeof(ncm);
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+            // Prefer Segoe UI for a current Windows look; keep system sizing and fall
+            // back naturally to the OS message-font metrics if font creation fails.
+            lstrcpynW(ncm.lfMessageFont.lfFaceName, L"Segoe UI", LF_FACESIZE);
+            ncm.lfMessageFont.lfQuality = CLEARTYPE_QUALITY;
             g_font = CreateFontIndirectW(&ncm.lfMessageFont);
+            LOGFONTW strong = ncm.lfMessageFont;
+            strong.lfWeight = FW_SEMIBOLD;
+            g_fontStrong = CreateFontIndirectW(&strong);
+            if (!g_fontStrong) g_fontStrong = g_font;
 
             // Tabs are owner-drawn so their background and captions can follow the
             // selected theme instead of leaving a light strip in dark mode.
@@ -948,14 +1024,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                   BS_DEFPUSHBUTTON | BS_PUSHBUTTON, 0, 0, lx, lh + SX(8));
             g_lblLog   = MkStatic(hwnd, IDC_LBL_LOG, 0, 0, 0, lx, SX(16));
             g_log      = CreateWindowExW(
-                WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE |
+                0, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | ES_MULTILINE |
                     ES_AUTOVSCROLL | ES_READONLY,
                 0, 0, lx, lh, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOG)), g_hInst, nullptr);
 
-            g_placeholder = MkStatic(hwnd, IDC_PLACEHOLDER, SS_CENTER | WS_BORDER, 0, 0,
-                                     10, 10);
+            g_placeholder = MkStatic(hwnd, IDC_PLACEHOLDER, SS_CENTER, 0, 0, 10, 10);
 
             // Insert the three pages before ApplyLanguage sets localized captions.
             TCITEMW ti = {};
@@ -969,12 +1044,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             // default states
             SendMessageW(g_backup, BM_SETCHECK, BST_CHECKED, 0);
-            ComboBox_SetCurSel(g_tgtEmu, 1);
 
             // fonts for everything
             SendMessageW(g_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
             for (HWND* h : kNesCtrls)
                 if (*h) SendMessageW(*h, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+            if (g_fontStrong) {
+                SendMessageW(g_grpSource, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontStrong), TRUE);
+                SendMessageW(g_grpTarget, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontStrong), TRUE);
+                SendMessageW(g_grpOptions, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontStrong), TRUE);
+            }
             SendMessageW(g_placeholder, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
             LoadLangIni();
@@ -992,7 +1071,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_ERASEBKGND: {
-            if (!g_darkTheme) return DefWindowProcW(hwnd, msg, wParam, lParam);
             RECT rc = {};
             GetClientRect(hwnd, &rc);
             FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeWindowBrush());
@@ -1005,9 +1083,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CTLCOLORLISTBOX: {
             HDC dc = reinterpret_cast<HDC>(wParam);
             HWND control = reinterpret_cast<HWND>(lParam);
-            if (!g_darkTheme) return DefWindowProcW(hwnd, msg, wParam, lParam);
-            SetTextColor(dc, ThemeTextColor());
             if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+                SetTextColor(dc, ThemeTextColor());
                 SetBkMode(dc, OPAQUE);
                 SetBkColor(dc, ThemeEditColor());
                 return reinterpret_cast<INT_PTR>(ThemeEditBrush());
@@ -1047,11 +1124,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             if (dis->hwndItem == g_tabs &&
                 dis->itemID < static_cast<UINT>(TabCtrl_GetItemCount(g_tabs))) {
-                const bool selected = (static_cast<int>(dis->itemID) == TabCtrl_GetCurSel(g_tabs));
-                HBRUSH fill = g_darkTheme
-                    ? (selected ? ThemeSurfaceBrush() : ThemeWindowBrush())
-                    : GetSysColorBrush(selected ? COLOR_WINDOW : COLOR_BTNFACE);
-                FillRect(dis->hDC, &dis->rcItem, fill);
+                const bool selected =
+                    static_cast<int>(dis->itemID) == TabCtrl_GetCurSel(g_tabs);
+                FillRect(dis->hDC, &dis->rcItem, ThemeWindowBrush());
+                RECT pill = dis->rcItem;
+                InflateRect(&pill, -SX(2), -SX(1));
+                DrawRoundedSurface(dis->hDC, pill,
+                                   selected ? ThemeAccentColor() : ThemeSurfaceColor(),
+                                   selected ? ThemeAccentColor() : ThemeBorderColor(), 6);
 
                 wchar_t caption[128] = {};
                 TCITEMW ti = {};
@@ -1060,70 +1140,80 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ti.cchTextMax = static_cast<int>(std::size(caption));
                 TabCtrl_GetItem(g_tabs, static_cast<int>(dis->itemID), &ti);
                 SetBkMode(dis->hDC, TRANSPARENT);
-                SetTextColor(dis->hDC, ThemeTextColor());
-                RECT textRc = dis->rcItem;
+                SetTextColor(dis->hDC, selected ? ThemeAccentTextColor() : ThemeTextColor());
+                RECT textRc = pill;
                 InflateRect(&textRc, -SX(4), -SX(1));
                 DrawTextW(dis->hDC, caption, -1, &textRc,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                if (g_darkTheme) {
-                    HBRUSH border = CreateSolidBrush(RGB(70, 74, 80));
-                    if (border) { FrameRect(dis->hDC, &dis->rcItem, border); DeleteObject(border); }
-                } else {
-                    DrawEdge(dis->hDC, const_cast<RECT*>(&dis->rcItem),
-                             selected ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
-                }
+                return TRUE;
+            }
+
+            if (dis->CtlType == ODT_BUTTON && IsOwnerDrawGroupBox(dis->hwndItem)) {
+                FillRect(dis->hDC, &dis->rcItem, ThemeWindowBrush());
+                RECT panel = dis->rcItem;
+                InflateRect(&panel, -SX(1), -SX(1));
+                DrawRoundedSurface(dis->hDC, panel, ThemeSurfaceColor(), ThemeBorderColor(), 8);
+
+                wchar_t caption[128] = {};
+                GetWindowTextW(dis->hwndItem, caption, static_cast<int>(std::size(caption)));
+                RECT textRc = panel;
+                textRc.left += SX(12);
+                textRc.top += SX(4);
+                textRc.right -= SX(10);
+                textRc.bottom = textRc.top + SX(20);
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, ThemeTextColor());
+                HGDIOBJ oldFont = nullptr;
+                if (g_fontStrong) oldFont = SelectObject(dis->hDC, g_fontStrong);
+                DrawTextW(dis->hDC, caption, -1, &textRc,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                if (oldFont) SelectObject(dis->hDC, oldFont);
                 return TRUE;
             }
 
             if (dis->CtlType == ODT_BUTTON && IsOwnerDrawPushButton(dis->hwndItem)) {
                 const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
                 const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+                const bool hot = (dis->itemState & ODS_HOTLIGHT) != 0;
                 const bool focused = (dis->itemState & ODS_FOCUS) != 0;
-                RECT rc = dis->rcItem;
-                HBRUSH fill = g_darkTheme
-                    ? ThemeSurfaceBrush()
-                    : GetSysColorBrush(COLOR_BTNFACE);
-                FillRect(dis->hDC, &rc, fill);
+                const bool primary = dis->hwndItem == g_convert;
+                RECT button = dis->rcItem;
+                InflateRect(&button, -SX(1), -SX(1));
+                FillRect(dis->hDC, &dis->rcItem, ThemeWindowBrush());
 
-                if (g_darkTheme) {
-                    HBRUSH border = CreateSolidBrush(pressed ? RGB(100, 105, 112)
-                                                              : RGB(76, 81, 88));
-                    if (border) { FrameRect(dis->hDC, &rc, border); DeleteObject(border); }
-                    if (dis->hwndItem == g_convert && !pressed) {
-                        RECT defaultRc = rc;
-                        InflateRect(&defaultRc, -2, -2);
-                        HBRUSH accent = CreateSolidBrush(RGB(82, 117, 151));
-                        if (accent) { FrameRect(dis->hDC, &defaultRc, accent); DeleteObject(accent); }
-                    }
-                    if (pressed) {
-                        HBRUSH pressedFill = CreateSolidBrush(RGB(53, 57, 62));
-                        if (pressedFill) {
-                            InflateRect(&rc, -1, -1);
-                            FillRect(dis->hDC, &rc, pressedFill);
-                            DeleteObject(pressedFill);
-                        }
-                    }
+                COLORREF fill = ThemeSurfaceColor();
+                COLORREF border = ThemeBorderColor();
+                COLORREF text = ThemeTextColor();
+                if (primary) {
+                    fill = pressed ? ThemeAccentDownColor()
+                                   : (hot ? ThemeAccentHoverColor() : ThemeAccentColor());
+                    border = fill;
+                    text = ThemeAccentTextColor();
                 } else {
-                    DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
-                    if (dis->hwndItem == g_convert && !pressed) {
-                        RECT defaultRc = rc;
-                        InflateRect(&defaultRc, -2, -2);
-                        DrawEdge(dis->hDC, &defaultRc, EDGE_BUMP, BF_RECT);
-                    }
+                    if (pressed) fill = ThemeControlDownColor();
+                    else if (hot) fill = ThemeControlHoverColor();
+                    if (focused) border = ThemeAccentColor();
                 }
+                if (disabled) {
+                    fill = ThemeWindowColor();
+                    border = ThemeBorderColor();
+                    text = ThemeMutedTextColor();
+                }
+                DrawRoundedSurface(dis->hDC, button, fill, border, 6);
 
                 wchar_t caption[128] = {};
                 GetWindowTextW(dis->hwndItem, caption, static_cast<int>(std::size(caption)));
-                RECT textRc = dis->rcItem;
-                InflateRect(&textRc, -SX(6), -SX(3));
+                RECT textRc = button;
+                InflateRect(&textRc, -SX(7), -SX(3));
                 if (pressed) OffsetRect(&textRc, SX(1), SX(1));
                 SetBkMode(dis->hDC, TRANSPARENT);
-                SetTextColor(dis->hDC, disabled ? ThemeMutedTextColor() : ThemeTextColor());
+                SetTextColor(dis->hDC, text);
                 DrawTextW(dis->hDC, caption, -1, &textRc,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                if (focused) {
-                    InflateRect(&textRc, -SX(2), -SX(1));
-                    DrawFocusRect(dis->hDC, &textRc);
+                if (focused && !primary) {
+                    RECT focusRc = button;
+                    InflateRect(&focusRc, -SX(4), -SX(4));
+                    DrawFocusRect(dis->hDC, &focusRc);
                 }
                 return TRUE;
             }
@@ -1210,12 +1300,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_NCDESTROY: {
             if (hwnd == g_main) DestroyMainMenu(hwnd);
             const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (g_fontStrong && g_fontStrong != g_font) DeleteObject(g_fontStrong);
+            g_fontStrong = nullptr;
             if (g_font) {
                 DeleteObject(g_font);
                 g_font = nullptr;
             }
             if (g_brushWindow) { DeleteObject(g_brushWindow); g_brushWindow = nullptr; }
-            if (g_brushSurface) { DeleteObject(g_brushSurface); g_brushSurface = nullptr; }
             if (g_brushEdit) { DeleteObject(g_brushEdit); g_brushEdit = nullptr; }
             if (g_main == hwnd) g_main = nullptr;
             return result;
@@ -1257,7 +1348,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
                                                GetSystemMetrics(SM_CXSMICON),
                                                GetSystemMetrics(SM_CYSMICON),
                                                LR_DEFAULTCOLOR));
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = L"RetroSaveConverterWnd";
 
     if (!RegisterClassExW(&wc)) {
