@@ -1,0 +1,18 @@
+# build artifacts
+build/
+*.o
+*.obj
+*.res
+*.exe
+*.pdb
+*.ilk
+
+# runtime files created by the app
+*.bak
+RetroSaveConverter.ini
+
+# editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,52 @@
+# ========================================================================================
+# RetroSaveConverter — manual build workflow
+#
+# HOW TO USE:
+#   1. Push this repository to GitHub
+#   2. Open the "Actions" tab of the repository
+#   3. Select "Manual build (Windows exe)" in the workflows list (left panel)
+#   4. Click "Run workflow" button and confirm
+#   5. When the run finishes, download the "RetroSaveConverter-win64" artifact —
+#      it contains a static RetroSaveConverter.exe for Windows 7 x64 and later
+#
+# The workflow cross-compiles with MinGW-w64 on Ubuntu, runs the core engine
+# unit tests first, and uploads the resulting executable as an artifact.
+# ========================================================================================
+name: Manual build (Windows exe)
+
+on:
+  workflow_dispatch:      # manual trigger only
+  # push:                 # uncomment to also build on every push
+  #   branches: [ master, main ]
+  # pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Run core engine unit tests
+        run: |
+          g++ -std=c++17 -O1 -Wall -Wextra -o test_converter \
+              tests/test_converter.cpp src/converter.cpp
+          ./test_converter
+
+      - name: Build Windows executable (Windows 7 x64+ compatible)
+        run: |
+          chmod +x build.sh
+          ./build.sh RetroSaveConverter.exe
+          file RetroSaveConverter.exe || true
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RetroSaveConverter-win64
+          path: RetroSaveConverter.exe
+          if-no-files-found: error
