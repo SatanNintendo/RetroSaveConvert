@@ -27,9 +27,8 @@
 #include <shlobj.h>
 
 #include <algorithm>
-#include <cctype>
-#include <cstdio>
 #include <cwctype>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -91,18 +90,45 @@ struct WinEnv : rsc::IEnv {
     }
 
     bool WriteFileBytes(const std::wstring& path, const uint8_t* data, size_t size) override {
-        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        if (size > 0 && data == nullptr) return false;
+
+        // Write beside the destination, then replace it only after the complete
+        // payload has been flushed. A failed/short write therefore cannot truncate
+        // an existing save file.
+        const size_t slash = path.find_last_of(L"\\/");
+        const std::wstring directory =
+            (slash == std::wstring::npos) ? L".\\" : path.substr(0, slash + 1);
+        wchar_t tempPath[MAX_PATH + 1] = {0};
+        if (!GetTempFileNameW(directory.c_str(), L"RSC", 0, tempPath)) return false;
+
+        HANDLE h = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        DWORD wr = 0;
-        bool ok = true;
-        if (size) {
-            if (!WriteFile(h, data, static_cast<DWORD>(size), &wr, nullptr) ||
-                wr != static_cast<DWORD>(size))
-                ok = false;
+        if (h == INVALID_HANDLE_VALUE) {
+            DeleteFileW(tempPath);
+            return false;
         }
-        CloseHandle(h);
-        return ok;
+
+        bool ok = true;
+        size_t offset = 0;
+        while (offset < size) {
+            const size_t remaining = size - offset;
+            const DWORD chunk = remaining > MAXDWORD ? MAXDWORD
+                                                     : static_cast<DWORD>(remaining);
+            DWORD written = 0;
+            if (!WriteFile(h, data + offset, chunk, &written, nullptr) || written == 0) {
+                ok = false;
+                break;
+            }
+            offset += written;
+        }
+        if (ok && !FlushFileBuffers(h)) ok = false;
+        if (!CloseHandle(h)) ok = false;
+        if (ok && MoveFileExW(tempPath, path.c_str(),
+                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return true;
+
+        DeleteFileW(tempPath);
+        return false;
     }
 
     bool FileExists(const std::wstring& path) override {
@@ -183,14 +209,21 @@ static std::wstring ExeDirW() {
 
 static void SaveLangIni() {
     const std::wstring ini = ExeDirW() + L"RetroSaveConverter.ini";
+    // Store a textual value and read it back as text. GetPrivateProfileIntW cannot
+    // parse the "ru" / "en" values written here and silently falls back to English.
     WritePrivateProfileStringW(L"Settings", L"Language",
                                g_lang == rsc::LANG_RU ? L"ru" : L"en", ini.c_str());
 }
 
 static void LoadLangIni() {
     const std::wstring ini = ExeDirW() + L"RetroSaveConverter.ini";
-    UINT v = GetPrivateProfileIntW(L"Settings", L"Language", 0, ini.c_str());
-    g_lang = (v == 1) ? rsc::LANG_RU : rsc::LANG_EN;
+    wchar_t value[16] = L"en";
+    GetPrivateProfileStringW(L"Settings", L"Language", L"en", value,
+                             static_cast<DWORD>(std::size(value)), ini.c_str());
+    const std::wstring saved = ToLowerW(value);
+    // Accept the textual values used by the application and numeric values from
+    // hand-edited / older configuration files for backward compatibility.
+    g_lang = (saved == L"ru" || saved == L"1") ? rsc::LANG_RU : rsc::LANG_EN;
 }
 
 // ========================================================================================
@@ -245,8 +278,8 @@ static void ShowNesPage(bool show) {
 // Layout
 // ========================================================================================
 static void LayoutAll() {
-    RECT rc;
-    GetClientRect(g_main, &rc);
+    RECT rc = {};
+    if (!g_main || !g_tabs || !GetClientRect(g_main, &rc)) return;
     MoveWindow(g_tabs, 0, 0, rc.right, rc.bottom, TRUE);
 
     RECT disp = rc;
@@ -321,7 +354,6 @@ static void LayoutAll() {
 // Language handling
 // ========================================================================================
 static void RebuildCombos() {
-    struct Cb { HWND h; const wchar_t* items[6]; int defSel; };
     // source emulator combo: index matches rsc::Emu exactly
     // (Auto, MesenCE, Nestopia, Nintendulator, Raw)
     const wchar_t* emuNames[5] = {Str(S_AutoDetect, g_lang), L"MesenCE", L"Nestopia",
@@ -392,23 +424,50 @@ static void ApplyLanguage(rsc::Lang lang, bool saveIni) {
     SetWindowTextW(g_placeholder, (cur == 2) ? Str(S_ComingSoonN64, lang)
                                              : Str(S_ComingSoonSnes, lang));
 
-    // menu
-    HMENU old = GetMenu(g_main);
+    // Rebuild the menu after the main HWND has been assigned in WM_NCCREATE.
+    // Destroy the previous menu only after the new one has been attached.
     HMENU bar = CreateMenu();
     HMENU mLang = CreatePopupMenu();
-    AppendMenuW(mLang, MF_STRING, IDM_LANG_EN, Str(S_MenuEnglish, lang));
-    AppendMenuW(mLang, MF_STRING, IDM_LANG_RU, Str(S_MenuRussian, lang));
     HMENU mHelp = CreatePopupMenu();
-    AppendMenuW(mHelp, MF_STRING, IDM_ABOUT, Str(S_MenuAbout, lang));
-    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(mLang),
-                Str(S_MenuLanguage, lang));
-    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(mHelp), Str(S_MenuHelp, lang));
-    CheckMenuRadioItem(mLang, IDM_LANG_EN, IDM_LANG_RU,
-                       IDM_LANG_EN + static_cast<int>(lang), MF_BYCOMMAND);
-    SetMenu(g_main, bar);
-    if (old) DestroyMenu(old);
-    DrawMenuBar(g_main);
+    if (!bar || !mLang || !mHelp) {
+        if (bar) DestroyMenu(bar);
+        if (mLang) DestroyMenu(mLang);
+        if (mHelp) DestroyMenu(mHelp);
+    } else {
+        bool langAttached = false;
+        bool helpAttached = false;
+        const bool langItemsOk =
+            AppendMenuW(mLang, MF_STRING, IDM_LANG_EN, Str(S_MenuEnglish, lang)) &&
+            AppendMenuW(mLang, MF_STRING, IDM_LANG_RU, Str(S_MenuRussian, lang));
+        const bool helpItemsOk =
+            AppendMenuW(mHelp, MF_STRING, IDM_ABOUT, Str(S_MenuAbout, lang));
+        if (langItemsOk)
+            langAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(mLang),
+                                       Str(S_MenuLanguage, lang)) != FALSE;
+        if (helpItemsOk)
+            helpAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(mHelp),
+                                       Str(S_MenuHelp, lang)) != FALSE;
 
+        if (langItemsOk && helpItemsOk && langAttached && helpAttached) {
+            CheckMenuRadioItem(mLang, IDM_LANG_EN, IDM_LANG_RU,
+                               IDM_LANG_EN + static_cast<int>(lang), MF_BYCOMMAND);
+            HMENU old = GetMenu(g_main);
+            if (SetMenu(g_main, bar)) {
+                DrawMenuBar(g_main);
+                if (old) DestroyMenu(old);
+            } else {
+                DestroyMenu(bar); // destroys both attached submenus
+            }
+        } else {
+            // Destroy the bar first, then only submenus that it does not own.
+            DestroyMenu(bar);
+            if (mLang && !langAttached) DestroyMenu(mLang);
+            if (mHelp && !helpAttached) DestroyMenu(mHelp);
+        }
+    }
+
+    RedrawWindow(g_main, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     if (saveIni) SaveLangIni();
 }
 
@@ -582,17 +641,36 @@ static void OnDropFiles(HDROP hd) {
 }
 
 // ========================================================================================
+// Theme refresh
+// ========================================================================================
+static void RefreshWindowPainting(HWND hwnd) {
+    if (!IsWindow(hwnd)) return;
+    DrawMenuBar(hwnd);
+    RedrawWindow(hwnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+// ========================================================================================
 // Window procedure
 // ========================================================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_NCCREATE:
+            // WM_CREATE is sent from inside CreateWindowExW, before that function
+            // returns. Set the global handle here so initial menu/layout work uses
+            // the real window rather than nullptr.
+            g_main = hwnd;
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         case WM_CREATE: {
             CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
 
             // DPI scale
             HDC dc = GetDC(hwnd);
-            g_scale = GetDeviceCaps(dc, LOGPIXELSX) / 96.0f;
-            ReleaseDC(hwnd, dc);
+            if (dc) {
+                const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+                if (dpi > 0) g_scale = dpi / 96.0f;
+                ReleaseDC(hwnd, dc);
+            }
             if (g_scale < 1.0f) g_scale = 1.0f;
 
             // message font
@@ -682,6 +760,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_SETTINGCHANGE: {
+            // Let Windows update themed controls first, then repaint the complete
+            // child tree. This avoids stale/light fragments after an OS theme or
+            // system-colour change while the application is running.
+            const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (hwnd == g_main) RefreshWindowPainting(hwnd);
+            return result;
+        }
+
         case WM_SIZE:
             LayoutAll();
             return 0;
@@ -764,6 +853,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             PostQuitMessage(0);
             return 0;
 
+        case WM_NCDESTROY: {
+            const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (g_font) {
+                DeleteObject(g_font);
+                g_font = nullptr;
+            }
+            if (g_main == hwnd) g_main = nullptr;
+            return result;
+        }
+
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -778,8 +877,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
-    InitCommonControlsEx(&icc);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (!InitCommonControlsEx(&icc)) return 1;
+
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool comInitialized = SUCCEEDED(comResult);
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -788,12 +889,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(2));
-    wc.hIconSm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(2), IMAGE_ICON,
-                                   GetSystemMetrics(SM_CXSMICON),
-                                   GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    wc.hIconSm = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(2), IMAGE_ICON,
+                                               GetSystemMetrics(SM_CXSMICON),
+                                               GetSystemMetrics(SM_CYSMICON),
+                                               LR_DEFAULTCOLOR));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"RetroSaveConverterWnd";
-    RegisterClassExW(&wc);
+
+    if (!RegisterClassExW(&wc)) {
+        if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+        if (comInitialized) CoUninitialize();
+        return 1;
+    }
 
     const int W = SX(560), H = SX(590);
     RECT adj = {0, 0, W, H};
@@ -803,19 +910,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
                              WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, CW_USEDEFAULT,
                              CW_USEDEFAULT, adj.right - adj.left, adj.bottom - adj.top,
                              nullptr, nullptr, hInstance, nullptr);
-    if (!g_main) return 1;
+    if (!g_main) {
+        UnregisterClassW(wc.lpszClassName, hInstance);
+        if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+        if (comInitialized) CoUninitialize();
+        return 1;
+    }
 
     ShowWindow(g_main, nCmdShow);
     UpdateWindow(g_main);
 
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
+    MSG msg = {};
+    BOOL messageResult = 0;
+    while ((messageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         if (!IsDialogMessageW(g_main, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
 
-    CoUninitialize();
-    return static_cast<int>(msg.wParam);
+    const int exitCode = (messageResult == -1) ? 1 : static_cast<int>(msg.wParam);
+    UnregisterClassW(wc.lpszClassName, hInstance);
+    if (wc.hIconSm) DestroyIcon(wc.hIconSm);
+    if (comInitialized) CoUninitialize();
+    return exitCode;
 }

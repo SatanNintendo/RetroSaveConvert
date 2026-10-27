@@ -47,11 +47,19 @@ struct RamEnv : IEnv {
         return true;
     }
     bool WriteFileBytes(const std::wstring& path, const uint8_t* data, size_t size) override {
-        files[path] = std::vector<uint8_t>(data, data + size);
+        if (size == 0) files[path].clear();
+        else files[path] = std::vector<uint8_t>(data, data + size);
         return true;
     }
     bool FileExists(const std::wstring& path) override {
         return files.find(path) != files.end();
+    }
+};
+
+struct BackupWriteFailEnv : RamEnv {
+    bool WriteFileBytes(const std::wstring& path, const uint8_t* data, size_t size) override {
+        if (path.find(L".bak") != std::wstring::npos) return false;
+        return RamEnv::WriteFileBytes(path, data, size);
     }
 };
 
@@ -110,6 +118,7 @@ static void TestHeaderParsing() {
 
     std::vector<uint8_t> junk = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     CHECK(!ParseNesHeader(junk.data(), junk.size()).valid);
+    CHECK(!ParseNesHeader(nullptr, 16).valid);
 }
 
 static void TestSramRoundtrip() {
@@ -373,6 +382,34 @@ static void TestWriteOutputs() {
     CHECK(HasMsg(r, Msg::WarnOverwrite));
     CHECK_EQ(env.files[L"C:/saves/Zelda.sav"].size(), (size_t)8192);
     CHECK(env.files[L"C:/saves/Zelda.sav.bak"] == half);
+
+    // Existing backups must never be overwritten; new backups get a numbered name.
+    RamEnv envBackup;
+    envBackup.files[L"C:/saves/Zelda.sav"] = half;
+    const std::vector<uint8_t> previousBackup = MakeBytes(32, 0xA5);
+    envBackup.files[L"C:/saves/Zelda.sav.bak"] = previousBackup;
+    q = BasicReq(L"C:/saves/Zelda.sav", half);
+    q.target = Emu::Nintendulator;
+    q.rom = ParseNesHeader(MakeNes(1, true).data(), 16);
+    r = Convert(q, envBackup);
+    CHECK(r.ok);
+    written = WriteOutputs(r, q, envBackup);
+    CHECK(written);
+    CHECK(envBackup.files[L"C:/saves/Zelda.sav.bak"] == previousBackup);
+    CHECK(envBackup.files[L"C:/saves/Zelda.sav.bak.1"] == half);
+
+    // If a requested backup cannot be created, keep the old save untouched.
+    BackupWriteFailEnv envFail;
+    envFail.files[L"C:/saves/Zelda.sav"] = half;
+    q = BasicReq(L"C:/saves/Zelda.sav", half);
+    q.target = Emu::Nintendulator;
+    q.rom = ParseNesHeader(MakeNes(1, true).data(), 16);
+    r = Convert(q, envFail);
+    CHECK(r.ok);
+    written = WriteOutputs(r, q, envFail);
+    CHECK(!written);
+    CHECK(envFail.files[L"C:/saves/Zelda.sav"] == half);
+    CHECK(r.HasErrors());
 
     // identity (source already equals output) -> NoAction, file untouched
     RamEnv env2;

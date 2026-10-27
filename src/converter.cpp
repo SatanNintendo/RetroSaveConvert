@@ -4,7 +4,7 @@
 #include "converter.h"
 
 #include <algorithm>
-#include <cstring>
+#include <utility>
 
 namespace rsc {
 
@@ -76,7 +76,7 @@ constexpr size_t kMinFileSize = 16;  // smaller than this = definitely not a sav
 // ---------------------------------------------------------------------------------------
 bool RomInfo::Parse(const uint8_t* d, size_t n) {
     *this = RomInfo{};
-    if (n < 16) return false;
+    if (d == nullptr || n < 16) return false;
     if (d[0] != 'N' || d[1] != 'E' || d[2] != 'S' || d[3] != 0x1A) return false;
 
     mapper = (d[6] >> 4) | (((d[7] & 0xF0) >> 4) << 4);  // lo nibble | hi nibble<<4
@@ -430,14 +430,37 @@ bool WriteOutputs(ConvertResult& result, const ConvertRequest& req, IEnv& env) {
 
         if (env.FileExists(out.path)) {
             if (req.backup) {
-                const std::wstring bak = out.path + L".bak";
-                std::vector<uint8_t> orig;
-                if (env.ReadFileBytes(out.path, orig)) {
-                    if (env.WriteFileBytes(bak, orig.data(), orig.size())) {
-                        AddIssue(result.issues, Severity::Info, Msg::BackupCreated,
+                // Never overwrite an older .bak silently. Keep the familiar .bak
+                // name for the first backup and use numbered siblings thereafter.
+                std::wstring bak = out.path + L".bak";
+                if (env.FileExists(bak)) {
+                    size_t suffix = 1;
+                    do {
+                        bak = out.path + L".bak." + Num(suffix++);
+                    } while (env.FileExists(bak) && suffix <= 1000000);
+                    if (env.FileExists(bak)) {
+                        AddIssue(result.issues, Severity::Error, Msg::ErrWriteFile,
                                  {GetName(bak)});
+                        allOk = false;
+                        continue;
                     }
                 }
+
+                std::vector<uint8_t> orig;
+                if (!env.ReadFileBytes(out.path, orig)) {
+                    AddIssue(result.issues, Severity::Error, Msg::ErrReadFile,
+                             {GetName(out.path)});
+                    allOk = false;
+                    continue; // Do not replace a file if its backup cannot be read.
+                }
+                if (!env.WriteFileBytes(bak, orig.data(), orig.size())) {
+                    AddIssue(result.issues, Severity::Error, Msg::ErrWriteFile,
+                             {GetName(bak)});
+                    allOk = false;
+                    continue; // Preserve the original unless its backup is secured.
+                }
+                AddIssue(result.issues, Severity::Info, Msg::BackupCreated,
+                         {GetName(bak)});
             }
             AddIssue(result.issues, Severity::Warning, Msg::WarnOverwrite,
                      {GetName(out.path)});
