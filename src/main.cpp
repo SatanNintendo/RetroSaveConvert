@@ -1372,9 +1372,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     RECT adj = {0, 0, W, H};
     AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
 
+    // The parent paints its own background in WM_ERASEBKGND. Without
+    // WS_CLIPCHILDREN, that erase can paint over child controls while the window
+    // is being resized, leaving combo-box selection text (notably Auto-detect)
+    // blank until Windows happens to repaint the control. Clip parent painting
+    // around all child HWNDs in both light and dark themes.
+    const DWORD mainStyle = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
     g_main = CreateWindowExW(0, L"RetroSaveConverterWnd", L"Retro Save Converter",
-                             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, CW_USEDEFAULT,
-                             CW_USEDEFAULT, adj.right - adj.left, adj.bottom - adj.top,
+                             mainStyle, CW_USEDEFAULT, CW_USEDEFAULT,
+                             adj.right - adj.left, adj.bottom - adj.top,
                              nullptr, nullptr, hInstance, nullptr);
     if (!g_main) {
         UnregisterClassW(wc.lpszClassName, hInstance);
