@@ -26,7 +26,7 @@ echo "[2/3] compiling sources..."
     -static -static-libgcc -static-libstdc++ \
     src/main.cpp src/converter.cpp build/app.res \
     -o "$OUT" \
-    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32
+    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -ladvapi32 -luxtheme
 
 echo "[3/3] stripping..."
 "$WINDRES" --version > /dev/null

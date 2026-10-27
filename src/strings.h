@@ -77,7 +77,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"ROM file set: %1",
             L"Unsupported file type: %1",
             L"INFO", L"WARNING", L"ERROR",
-            L"Retro Save Converter 1.0\n\n"
+            L"Retro Save Converter 1.0.1\n\n"
             L"Converts in-game battery saves (NOT save states) between NES emulators:\n"
             L"MesenCE, Nestopia and Nintendulator.\n\n"
             L"Based on the save-format research of each emulator's source code.\n"
@@ -122,7 +122,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Файл ROM выбран: %1",
             L"Неподдерживаемый тип файла: %1",
             L"ИНФО", L"ВНИМАНИЕ", L"ОШИБКА",
-            L"Конвертер сохранений Retro 1.0\n\n"
+            L"Конвертер сохранений Retro 1.0.1\n\n"
             L"Конвертирует игровые сохранения (НЕ сейв-стейты) между эмуляторами NES:\n"
             L"MesenCE, Nestopia и Nintendulator.\n\n"
             L"Форматы сохранений изучены по исходному коду каждого эмулятора.\n"

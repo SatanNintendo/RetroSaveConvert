@@ -6,6 +6,18 @@ Started playing *Zelda* in MesenCE or Nestopia and want to continue in Nintendul
 
 Compatible with **Windows 7 x64 and later** — a single ~330 KB static executable with no runtime dependencies (no .NET, no installer).
 
+The app follows the **Windows dark mode** (Windows 10 1809+ / Windows 11): title bar, menus, tabs, buttons and fields are recolored live when you switch the system theme — no restart needed.
+
+---
+
+## Troubleshooting
+
+**"Publisher could not be verified" / SmartScreen warning on first launch.**
+The executable is not digitally signed (a code-signing certificate costs money), so Windows shows a warning for files downloaded from the Internet. The program itself requires no administrator rights (`requestedExecutionLevel="asInvoker"` is declared in its manifest). To dismiss the warning:
+
+* right-click the downloaded EXE → **Properties** → check **Unblock** (Разблокировать) → OK — this removes the Mark-of-the-Web; or
+* in the SmartScreen dialog click **More info** → **Run anyway** (Выполнить в любом случае).
+
 ---
 
 ## Supported emulators (NES/FC tab)
@@ -30,7 +42,7 @@ All directions between the supported emulators work. A `Generic (.sav)` source/t
 
 Extra safety:
 
-* every file that is about to be replaced gets a **`.bak` backup** (toggleable); existing backups are preserved and subsequent backups use `.bak.1`, `.bak.2`, etc.; if a requested backup cannot be secured, that output is not overwritten;
+* every file that is about to be replaced gets a **`.bak` backup** (toggleable);
 * the log explains every decision, warning and error;
 * converting between incompatible types (e.g. an EEPROM dump into an SRAM-only flow, or a Datach save into Nintendulator) is refused with a clear reason.
 
@@ -53,7 +65,7 @@ This converter was written by reading the actual emulator sources — this is wh
 
 **A key finding:** all three emulators store EEPROM bytes in memory in exactly the same bit order (24C01 — LSB-first, 24C02 — MSB-first), so no bit-reversal is ever needed; conversions are byte-preserving, and the only differences are file names/extensions and the Datach split/merge. This has been verified in each emulator's chip-driver code (`Eeprom24C01.h` / `X24C0X<128>` / `EEPROM_24C01` respectively).
 
-The core engine is covered by **254 unit checks** (`tests/test_converter.cpp`) that round-trip every save kind between all emulators, split/merge Datach pairs, and verify padding/backup/refusal logic.
+The core engine is covered by **244 unit checks** (`tests/test_converter.cpp`) that round-trip every save kind between all emulators, split/merge Datach pairs, and verify padding/backup/refusal logic.
 
 ## Building
 
@@ -79,10 +91,6 @@ Double-click or run from a console; the script auto-detects the toolchain:
 sudo apt-get install g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 ./build.sh            # produces RetroSaveConverter.exe
 ```
-
-### Windows publisher warning
-
-The project build produces an **unsigned** executable. Depending on how it is obtained and on Windows security policy, the EXE may trigger an unknown-publisher or SmartScreen reputation warning. The manifest declares `asInvoker` because the converter does not need administrator privileges, but that does not establish publisher identity. A trusted Authenticode signature is needed to identify the publisher; a new file or certificate can still trigger a SmartScreen warning until sufficient reputation is established. A local “Unblock” action only removes the download mark for that copy and does not sign or otherwise certify the binary.
 
 ### Unit tests
 
@@ -132,7 +140,14 @@ MIT — see [LICENSE](LICENSE).
 
 Начали проходить *Zelda* в MesenCE или Nestopia и хотите продолжить в Nintendulator (или в любом другом направлении)? Программа конвертирует батарейное сохранение картриджа (SRAM / EEPROM) в формат, который поймёт целевой эмулятор, — и вы продолжаете игру с того же места.
 
-Совместима с **Windows 7 x64 и новее** — один статический exe ~330 КБ, без рантаймов и установщика. Язык интерфейса переключается в меню «Язык» (по умолчанию английский, выбор сохраняется в INI рядом с программой).
+Совместима с **Windows 7 x64 и новее** — один статический exe ~330 КБ, без рантаймов и установщика. Язык интерфейса переключается в меню «Язык» (по умолчанию английский, выбор сохраняется в INI рядом с программой; если запись рядом с exe невозможна — в %APPDATA%\RetroSaveConverter). Приложение поддерживает **тёмную тему Windows** (10 1809+/11) и переключается на неё без перезапуска.
+
+## Если Windows показывает «Не удаётся проверить издателя»
+
+Программа не имеет цифровой подписи (сертификат стоит денег), поэтому при первом запуске скачанного из интернета exe Windows может показать предупреждение. Сама программа прав администратора не требует (в манифесте указан `requestedExecutionLevel="asInvoker"`). Чтобы убрать предупреждение:
+
+* ПКМ по скачанному exe → **Свойства** → галочка **Разблокировать** → ОК; или
+* в окне SmartScreen нажмите **Подробнее** → **Выполнить в любом случае**.
 
 ## Как пользоваться
 
@@ -161,11 +176,7 @@ MIT — see [LICENSE](LICENSE).
 * **GitHub Actions**: вкладка *Actions* → *Manual build (Windows exe)* → *Run workflow* → скачать артефакт `RetroSaveConverter-win64`.
 * **Windows локально**: `build.cmd` (сам найдёт MinGW-w64 или MSVC).
 * **Linux (кросс)**: `sudo apt-get install g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 && ./build.sh`.
-* **Тесты**: `g++ -std=c++17 -O1 -Wall -Wextra -o test_converter tests/test_converter.cpp src/converter.cpp && ./test_converter` — 254 проверки.
-
-### Предупреждение Windows об издателе
-
-Сборка проекта создаёт **неподписанный** EXE. В зависимости от способа получения файла и политик безопасности Windows может показать предупреждение о неизвестном издателе или репутации SmartScreen. В манифесте указано `asInvoker`, поскольку программе не нужны права администратора, но это не подтверждает издателя. Для отображения проверенного издателя нужна доверенная подпись Authenticode; даже у нового подписанного файла/сертификата SmartScreen может продолжать показывать предупреждение, пока не накопится достаточная репутация. Локальное действие «Разблокировать» снимает метку скачивания только у этой копии и не подписывает и не сертифицирует EXE.
+* **Тесты**: `g++ -std=c++17 -O1 -Wall -Wextra -o test_converter tests/test_converter.cpp src/converter.cpp && ./test_converter` — 244 проверки.
 
 ## Лицензия
 
