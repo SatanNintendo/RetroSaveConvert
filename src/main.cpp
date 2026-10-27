@@ -1108,7 +1108,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_SIZE:
+            // Layout first, then invalidate the child tree. Do not rely on a mouse
+            // hover or a theme switch to trigger repainting of native combo/edit
+            // controls after the parent has erased its background during live resize.
             LayoutAll();
+            if (wParam != SIZE_MINIMIZED) {
+                RedrawWindow(hwnd, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+            }
+            return 0;
+
+        case WM_EXITSIZEMOVE:
+            // Final synchronous repaint after interactive resizing. This also
+            // repairs any stale owner-drawn tabs/buttons left by intermediate
+            // WM_SIZE paints, in either theme.
+            RefreshWindowPainting(hwnd);
             return 0;
 
         case WM_GETMINMAXINFO: {
@@ -1372,12 +1386,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     RECT adj = {0, 0, W, H};
     AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
 
-    // The parent paints its own background in WM_ERASEBKGND. Without
-    // WS_CLIPCHILDREN, that erase can paint over child controls while the window
-    // is being resized, leaving combo-box selection text (notably Auto-detect)
-    // blank until Windows happens to repaint the control. Clip parent painting
-    // around all child HWNDs in both light and dark themes.
-    const DWORD mainStyle = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
+    // Keep the normal child-window clipping behavior here. The parent owns a
+    // custom WM_ERASEBKGND handler and several controls use transparent/native
+    // painting; WS_CLIPCHILDREN prevented parts of the child tree from painting
+    // correctly on initial display. WM_SIZE and WM_EXITSIZEMOVE explicitly repaint
+    // the children instead so their contents stay visible during resizing.
+    const DWORD mainStyle = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX);
     g_main = CreateWindowExW(0, L"RetroSaveConverterWnd", L"Retro Save Converter",
                              mainStyle, CW_USEDEFAULT, CW_USEDEFAULT,
                              adj.right - adj.left, adj.bottom - adj.top,
