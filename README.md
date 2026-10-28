@@ -68,7 +68,7 @@ This converter was written by reading the actual emulator sources — this is wh
 
 EEPROM bytes are transferred as raw bytes; the converter does not reverse bits or add proprietary headers. Datach is rearranged only where an emulator uses a different block layout. The implementation above was checked against the source files shipped in the supplied FCEUX, puNES, and ares repositories.
 
-The core engine is covered by **341 unit checks** (`tests/test_converter.cpp`), including FCEUX's 512-byte Datach layout, puNES headers/NVRAM prefix handling and composite-file refusal, ares fixed filenames, and the existing backup/refusal logic.
+The core engine is covered by **1304 unit checks** (`tests/test_converter.cpp`), including regression tests for message expansion and undersized Datach sources, FCEUX's 512-byte Datach layout, puNES headers/NVRAM prefix handling and composite-file refusal, ares fixed filenames, and the existing backup/refusal logic.
 
 ## Building
 
@@ -179,7 +179,7 @@ MIT — see [LICENSE](LICENSE).
 * **GitHub Actions**: вкладка *Actions* → *Manual build (Windows exe)* → *Run workflow* → скачать артефакт `RetroSaveConverter-win64`.
 * **Windows локально**: `build.cmd` (сам найдёт MinGW-w64 или MSVC).
 * **Linux (кросс)**: `sudo apt-get install g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 && ./build.sh`.
-* **Тесты**: `g++ -std=c++17 -O1 -Wall -Wextra -o test_converter tests/test_converter.cpp src/converter.cpp && ./test_converter` — 341 проверка.
+* **Тесты**: `g++ -std=c++17 -O1 -Wall -Wextra -o test_converter tests/test_converter.cpp src/converter.cpp && ./test_converter` — 1304 проверка.
 
 ### Предупреждение Windows об издателе
 
