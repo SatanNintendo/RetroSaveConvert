@@ -53,6 +53,11 @@ static HMENU       g_menuBar = nullptr;
 static HMENU       g_menuLanguage = nullptr;
 static HMENU       g_menuView = nullptr;
 static HMENU       g_menuHelp = nullptr;
+// Dark theme only: menus are owner-drawn (native menus cannot be recoloured). In the light
+// theme the ordinary native menus are used, exactly as before.
+static bool        g_menuOwnerDraw = false;
+static HBRUSH      g_brushMenuBar = nullptr;     // owned by us; freed after the menu is destroyed
+static HBRUSH      g_brushMenuPopup = nullptr;
 
 // The three section panels ("Source", "Target", "Options") are NOT child windows.
 // They used to be owner-drawn BS_GROUPBOX controls; an opaque owner-drawn group box
@@ -458,7 +463,8 @@ static HWND MkEdit(HWND parent, int id, int x, int y, int w, int h) {
 static HWND MkCombo(HWND parent, int id, int x, int y, int w, int h) {
     return CreateWindowExW(0, L"COMBOBOX", L"",
                            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
-                               CBS_DROPDOWNLIST | WS_VSCROLL,
+                               CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS |
+                               WS_VSCROLL,
                            x, y, w, h, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst,
                            nullptr);
@@ -652,6 +658,16 @@ static bool SetMenuLabel(HMENU menu, UINT item, bool byPosition, const wchar_t* 
     return SetMenuItemInfoW(menu, item, byPosition ? TRUE : FALSE, &info) != FALSE;
 }
 
+// Appends one menu entry. In the dark theme the entry is owner-drawn and carries only a
+// label id (StrId + 1) as item data: its text is looked up in the current language at draw time.
+static BOOL AddMenuEntry(HMENU menu, UINT flags, UINT_PTR idOrSub, const wchar_t* text,
+                         rsc::StrId label) {
+    if (g_menuOwnerDraw)
+        return AppendMenuW(menu, flags | MF_OWNERDRAW, idOrSub,
+                           reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(label) + 1));
+    return AppendMenuW(menu, flags | MF_STRING, idOrSub, text);
+}
+
 static bool EnsureMainMenu() {
     if (!g_main || !IsWindow(g_main)) return false;
     if (g_menuBar && GetMenu(g_main) == g_menuBar && g_menuLanguage && g_menuView && g_menuHelp)
@@ -678,21 +694,23 @@ static bool EnsureMainMenu() {
     }
 
     const bool languageItemsOk =
-        AppendMenuW(language, MF_STRING, IDM_LANG_EN, L"English") != FALSE &&
-        AppendMenuW(language, MF_STRING, IDM_LANG_RU, L"Русский") != FALSE;
+        AddMenuEntry(language, 0, IDM_LANG_EN, L"English", S_MenuEnglish) != FALSE &&
+        AddMenuEntry(language, 0, IDM_LANG_RU, L"Русский", S_MenuRussian) != FALSE;
     const bool viewItemsOk =
-        AppendMenuW(view, MF_STRING, IDM_THEME_LIGHT, L"Light theme") != FALSE &&
-        AppendMenuW(view, MF_STRING, IDM_THEME_DARK, L"Dark theme") != FALSE;
-    const bool helpItemsOk = AppendMenuW(help, MF_STRING, IDM_ABOUT, L"About") != FALSE;
+        AddMenuEntry(view, 0, IDM_THEME_LIGHT, L"Light theme", S_MenuLightTheme) != FALSE &&
+        AddMenuEntry(view, 0, IDM_THEME_DARK, L"Dark theme", S_MenuDarkTheme) != FALSE;
+    const bool helpItemsOk = AddMenuEntry(help, 0, IDM_ABOUT, L"About", S_MenuAbout) != FALSE;
 
     bool languageAttached = false, viewAttached = false, helpAttached = false;
     if (languageItemsOk)
-        languageAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(language),
-                                       L"Language") != FALSE;
+        languageAttached = AddMenuEntry(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(language),
+                                        L"Language", S_MenuLanguage) != FALSE;
     if (viewItemsOk)
-        viewAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View") != FALSE;
+        viewAttached = AddMenuEntry(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View",
+                                    S_MenuView) != FALSE;
     if (helpItemsOk)
-        helpAttached = AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Help") != FALSE;
+        helpAttached = AddMenuEntry(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Help",
+                                    S_MenuHelp) != FALSE;
 
     if (!languageItemsOk || !viewItemsOk || !helpItemsOk || !languageAttached ||
         !viewAttached || !helpAttached || !SetMenu(g_main, bar)) {
@@ -707,6 +725,26 @@ static bool EnsureMainMenu() {
     g_menuLanguage = language;
     g_menuView = view;
     g_menuHelp = help;
+
+    if (g_menuOwnerDraw) {
+        // Dark background for the margins around owner-drawn items. The brushes are ours and
+        // must outlive the menus that reference them (freed in FreeMenuBrushes()).
+        if (!g_brushMenuBar) g_brushMenuBar = CreateSolidBrush(ThemeWindowColor());
+        if (!g_brushMenuPopup) g_brushMenuPopup = CreateSolidBrush(ThemeSurfaceColor());
+        MENUINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        mi.fMask = MIM_BACKGROUND;
+        if (g_brushMenuBar) {
+            mi.hbrBack = g_brushMenuBar;
+            SetMenuInfo(g_menuBar, &mi);
+        }
+        if (g_brushMenuPopup) {
+            mi.hbrBack = g_brushMenuPopup;
+            SetMenuInfo(g_menuLanguage, &mi);
+            SetMenuInfo(g_menuView, &mi);
+            SetMenuInfo(g_menuHelp, &mi);
+        }
+    }
     return true;
 }
 
@@ -714,14 +752,16 @@ static bool UpdateMenuLanguage(rsc::Lang lang) {
     if (!EnsureMainMenu()) return false;
 
     bool labelsOk = true;
-    labelsOk &= SetMenuLabel(g_menuBar, 0, true, Str(S_MenuLanguage, lang));
-    labelsOk &= SetMenuLabel(g_menuBar, 1, true, Str(S_MenuView, lang));
-    labelsOk &= SetMenuLabel(g_menuBar, 2, true, Str(S_MenuHelp, lang));
-    labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_EN, false, Str(S_MenuEnglish, lang));
-    labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_RU, false, Str(S_MenuRussian, lang));
-    labelsOk &= SetMenuLabel(g_menuView, IDM_THEME_LIGHT, false, Str(S_MenuLightTheme, lang));
-    labelsOk &= SetMenuLabel(g_menuView, IDM_THEME_DARK, false, Str(S_MenuDarkTheme, lang));
-    labelsOk &= SetMenuLabel(g_menuHelp, IDM_ABOUT, false, Str(S_MenuAbout, lang));
+    if (!g_menuOwnerDraw) {  // owner-drawn items fetch their text in the current language when drawn
+        labelsOk &= SetMenuLabel(g_menuBar, 0, true, Str(S_MenuLanguage, lang));
+        labelsOk &= SetMenuLabel(g_menuBar, 1, true, Str(S_MenuView, lang));
+        labelsOk &= SetMenuLabel(g_menuBar, 2, true, Str(S_MenuHelp, lang));
+        labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_EN, false, Str(S_MenuEnglish, lang));
+        labelsOk &= SetMenuLabel(g_menuLanguage, IDM_LANG_RU, false, Str(S_MenuRussian, lang));
+        labelsOk &= SetMenuLabel(g_menuView, IDM_THEME_LIGHT, false, Str(S_MenuLightTheme, lang));
+        labelsOk &= SetMenuLabel(g_menuView, IDM_THEME_DARK, false, Str(S_MenuDarkTheme, lang));
+        labelsOk &= SetMenuLabel(g_menuHelp, IDM_ABOUT, false, Str(S_MenuAbout, lang));
+    }
 
     CheckMenuRadioItem(g_menuLanguage, IDM_LANG_EN, IDM_LANG_RU,
                        IDM_LANG_EN + static_cast<int>(lang), MF_BYCOMMAND);
@@ -731,14 +771,46 @@ static bool UpdateMenuLanguage(rsc::Lang lang) {
     return labelsOk;
 }
 
+static void FreeMenuBrushes() {
+    if (g_brushMenuBar) { DeleteObject(g_brushMenuBar); g_brushMenuBar = nullptr; }
+    if (g_brushMenuPopup) { DeleteObject(g_brushMenuPopup); g_brushMenuPopup = nullptr; }
+}
+
 static void DestroyMainMenu(HWND hwnd) {
-    if (!g_menuBar) return;
-    if (IsWindow(hwnd) && GetMenu(hwnd) == g_menuBar) SetMenu(hwnd, nullptr);
-    DestroyMenu(g_menuBar);
-    g_menuBar = nullptr;
-    g_menuLanguage = nullptr;
-    g_menuView = nullptr;
-    g_menuHelp = nullptr;
+    if (g_menuBar) {
+        if (IsWindow(hwnd) && GetMenu(hwnd) == g_menuBar) SetMenu(hwnd, nullptr);
+        DestroyMenu(g_menuBar);
+        g_menuBar = nullptr;
+        g_menuLanguage = nullptr;
+        g_menuView = nullptr;
+        g_menuHelp = nullptr;
+    }
+    FreeMenuBrushes();  // only after the menus that used them are gone
+}
+
+// Switches between native menus (light theme) and owner-drawn menus (dark theme). A new
+// menu is built and attached first; the old one is destroyed only after SetMenu replaced it,
+// and is restored untouched if the new one cannot be created.
+static void RebuildMainMenuForTheme(bool dark) {
+    if (!g_main || !IsWindow(g_main) || g_menuOwnerDraw == dark) return;
+
+    HMENU oldBar = g_menuBar, oldLang = g_menuLanguage, oldView = g_menuView, oldHelp = g_menuHelp;
+    HBRUSH oldBarBrush = g_brushMenuBar, oldPopupBrush = g_brushMenuPopup;
+    g_menuBar = g_menuLanguage = g_menuView = g_menuHelp = nullptr;
+    g_brushMenuBar = g_brushMenuPopup = nullptr;
+    g_menuOwnerDraw = dark;
+
+    if (EnsureMainMenu()) {
+        if (oldBar) DestroyMenu(oldBar);
+        if (oldBarBrush) DeleteObject(oldBarBrush);
+        if (oldPopupBrush) DeleteObject(oldPopupBrush);
+        UpdateMenuLanguage(g_lang);  // a fresh menu starts with English placeholders
+    } else {
+        FreeMenuBrushes();
+        g_menuBar = oldBar; g_menuLanguage = oldLang; g_menuView = oldView; g_menuHelp = oldHelp;
+        g_brushMenuBar = oldBarBrush; g_brushMenuPopup = oldPopupBrush;
+        g_menuOwnerDraw = !dark;
+    }
 }
 
 static void RefreshWindowPainting(HWND hwnd) {
@@ -759,6 +831,7 @@ static void ApplyControlTheme(HWND control) {
 static void ApplyTheme(bool dark, bool saveIni) {
     g_darkTheme = dark;
     RecreateThemeBrushes();
+    RebuildMainMenuForTheme(dark);
 
     if (g_tabs) ApplyControlTheme(g_tabs);
     for (HWND* control : kNesCtrls) if (*control) ApplyControlTheme(*control);
@@ -767,6 +840,9 @@ static void ApplyTheme(bool dark, bool saveIni) {
     if (g_menuView) {
         CheckMenuRadioItem(g_menuView, IDM_THEME_LIGHT, IDM_THEME_DARK,
                            g_darkTheme ? IDM_THEME_DARK : IDM_THEME_LIGHT, MF_BYCOMMAND);
+        if (g_menuLanguage)
+            CheckMenuRadioItem(g_menuLanguage, IDM_LANG_EN, IDM_LANG_RU,
+                               IDM_LANG_EN + static_cast<int>(g_lang), MF_BYCOMMAND);
         if (g_main) DrawMenuBar(g_main);
     }
     if (saveIni) SaveThemeIni();
@@ -1117,6 +1193,260 @@ static void FillSolid(HDC dc, const RECT& rc, COLORREF color) {
 }
 
 // ========================================================================================
+// Owner-drawn combo boxes
+// The combos are CBS_OWNERDRAWFIXED so the drop-down items use the app palette. In the dark
+// theme the closed field (border, text, arrow) is painted by PaintDarkCombo from a subclass:
+// the classic control would draw a light 3-D border. Selection, keyboard handling and the
+// drop-down itself remain the control's own; only painting is replaced. Plain GDI only.
+// ========================================================================================
+static const int kComboItemHeight = 22;
+
+static std::wstring ComboItemText(HWND combo, LRESULT index) {
+    std::wstring text;
+    if (index == CB_ERR || index < 0) return text;
+    const LRESULT len = SendMessageW(combo, CB_GETLBTEXTLEN, static_cast<WPARAM>(index), 0);
+    if (len == CB_ERR || len <= 0 || len > 4096) return text;
+    try {
+        text.assign(static_cast<size_t>(len) + 1, L'\0');
+        const LRESULT got = SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(index),
+                                         reinterpret_cast<LPARAM>(&text[0]));
+        text.resize(got > 0 ? static_cast<size_t>(got) : 0);
+    } catch (...) {
+        text.clear();
+    }
+    return text;
+}
+
+static void PaintDarkCombo(HWND combo, HDC dc) {
+    RECT rc = {};
+    if (!GetClientRect(combo, &rc) || rc.right <= rc.left || rc.bottom <= rc.top) return;
+    const bool dropped = SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0) != 0;
+    const bool focused = GetFocus() == combo;
+
+    FillRect(dc, &rc, ThemeEditBrush());
+    if (HBRUSH border = CreateSolidBrush((focused || dropped) ? ThemeAccentColor()
+                                                              : ThemeBorderColor())) {
+        FrameRect(dc, &rc, border);
+        DeleteObject(border);
+    }
+
+    // arrow button
+    const int bw = (std::max)(static_cast<int>(GetSystemMetrics(SM_CXVSCROLL)), SX(18));
+    RECT btn = {rc.right - bw, rc.top + 1, rc.right - 1, rc.bottom - 1};
+    FillSolid(dc, btn, dropped ? ThemeControlDownColor() : ThemeSurfaceColor());
+    const int cx = (btn.left + btn.right) / 2, cy = (btn.top + btn.bottom) / 2;
+    const int a = SX(4), b = SX(2);
+    POINT tri[3] = {{cx - a, cy - b}, {cx + a + 1, cy - b}, {cx, cy + b + 1}};
+    if (HBRUSH fill = CreateSolidBrush(ThemeTextColor())) {
+        HGDIOBJ oldBrush = SelectObject(dc, fill);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        Polygon(dc, tri, 3);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(fill);
+    }
+
+    // selected text
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(combo, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+    const int oldMode = SetBkMode(dc, TRANSPARENT);
+    const COLORREF oldColor = SetTextColor(dc, ThemeTextColor());
+    const std::wstring text = ComboItemText(combo, SendMessageW(combo, CB_GETCURSEL, 0, 0));
+    RECT tr = {rc.left + SX(8), rc.top + 1, btn.left - SX(4), rc.bottom - 1};
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &tr,
+              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(dc, oldColor);
+    SetBkMode(dc, oldMode);
+    if (oldFont) SelectObject(dc, oldFont);
+}
+
+static LRESULT CALLBACK ComboSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR, DWORD_PTR) {
+    if (g_darkTheme) {
+        switch (msg) {
+            case WM_ERASEBKGND:
+                return 1;  // WM_PAINT covers the whole client area
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                HDC dc = BeginPaint(hwnd, &ps);
+                if (dc) PaintDarkCombo(hwnd, dc);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_PRINTCLIENT:
+                PaintDarkCombo(hwnd, reinterpret_cast<HDC>(wParam));
+                return 0;
+            case WM_SETFOCUS:
+            case WM_KILLFOCUS: {
+                const LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+                InvalidateRect(hwnd, nullptr, FALSE);  // focus changes the border colour
+                return r;
+            }
+            default:
+                break;
+        }
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static void DrawComboItem(const DRAWITEMSTRUCT* dis) {
+    const bool field = (dis->itemState & ODS_COMBOBOXEDIT) != 0;   // the closed selection field
+    if (field && g_darkTheme) {
+        PaintDarkCombo(dis->hwndItem, dis->hDC);
+        return;
+    }
+    const bool highlight = !field && (dis->itemState & ODS_SELECTED) != 0;
+    FillSolid(dis->hDC, dis->rcItem, highlight ? ThemeAccentColor() : ThemeEditColor());
+    if (dis->itemID == static_cast<UINT>(-1)) return;
+
+    const std::wstring text = ComboItemText(dis->hwndItem, static_cast<LRESULT>(dis->itemID));
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = font ? SelectObject(dis->hDC, font) : nullptr;
+    const int oldMode = SetBkMode(dis->hDC, TRANSPARENT);
+    const COLORREF oldColor =
+        SetTextColor(dis->hDC, highlight ? ThemeAccentTextColor() : ThemeTextColor());
+    RECT tr = dis->rcItem;
+    tr.left += SX(field ? 4 : 8);
+    DrawTextW(dis->hDC, text.c_str(), static_cast<int>(text.size()), &tr,
+              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(dis->hDC, oldColor);
+    SetBkMode(dis->hDC, oldMode);
+    if (oldFont) SelectObject(dis->hDC, oldFont);
+}
+
+// ========================================================================================
+// Owner-drawn menus (dark theme only; see g_menuOwnerDraw)
+// Item data = label id + 1, so text is always taken from the current language table.
+// ========================================================================================
+static bool MenuLabelIsBarItem(StrId id) {
+    return id == S_MenuLanguage || id == S_MenuView || id == S_MenuHelp;
+}
+
+static bool MenuItemLabel(ULONG_PTR itemData, StrId& id) {
+    if (itemData == 0 || itemData > static_cast<ULONG_PTR>(S_COUNT)) return false;
+    id = static_cast<StrId>(itemData - 1);
+    return true;
+}
+
+static void MeasureMenuItem(MEASUREITEMSTRUCT* mis) {
+    StrId label;
+    if (!MenuItemLabel(mis->itemData, label)) return;
+    const bool inBar = MenuLabelIsBarItem(label);
+    const wchar_t* text = Str(label, g_lang);
+
+    int textW = 0;
+    if (HDC dc = GetDC(g_main)) {
+        HGDIOBJ oldFont = g_font ? SelectObject(dc, g_font) : nullptr;
+        RECT calc = {};
+        DrawTextW(dc, text, -1, &calc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT);
+        textW = calc.right - calc.left + SX(8);   // room for the mnemonic underline / '&'
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(g_main, dc);
+    }
+    mis->itemWidth = static_cast<UINT>(textW + (inBar ? SX(20) : SX(28) + SX(24)));
+    mis->itemHeight = static_cast<UINT>(inBar ? SX(22) : SX(24));
+}
+
+static void DrawMenuItemOwner(const DRAWITEMSTRUCT* dis) {
+    StrId label;
+    if (!MenuItemLabel(dis->itemData, label)) return;
+    const bool inBar = MenuLabelIsBarItem(label);
+    const bool hot = (dis->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
+
+    const COLORREF bg = hot ? ThemeControlDownColor()
+                            : (inBar ? ThemeWindowColor() : ThemeSurfaceColor());
+    FillSolid(dis->hDC, dis->rcItem, bg);
+
+    const COLORREF fg = (dis->itemState & ODS_DISABLED) ? ThemeMutedTextColor()
+                                                        : ThemeTextColor();
+    if (!inBar && (dis->itemState & ODS_CHECKED)) {  // radio bullet in the left gutter
+        const int r = SX(3);
+        const int cx = dis->rcItem.left + SX(14);
+        const int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+        if (HBRUSH dot = CreateSolidBrush(fg)) {
+            HGDIOBJ oldBrush = SelectObject(dis->hDC, dot);
+            HGDIOBJ oldPen = SelectObject(dis->hDC, GetStockObject(NULL_PEN));
+            Ellipse(dis->hDC, cx - r, cy - r, cx + r + 1, cy + r + 1);
+            SelectObject(dis->hDC, oldPen);
+            SelectObject(dis->hDC, oldBrush);
+            DeleteObject(dot);
+        }
+    }
+
+    HGDIOBJ oldFont = g_font ? SelectObject(dis->hDC, g_font) : nullptr;
+    const int oldMode = SetBkMode(dis->hDC, TRANSPARENT);
+    const COLORREF oldColor = SetTextColor(dis->hDC, fg);
+    RECT tr = dis->rcItem;
+    UINT flags = DT_SINGLELINE | DT_VCENTER;
+    if (inBar) {
+        flags |= DT_CENTER;
+    } else {
+        flags |= DT_LEFT;
+        tr.left += SX(28);
+    }
+    if (dis->itemState & ODS_NOACCEL) flags |= DT_HIDEPREFIX;  // underline only after Alt
+    DrawTextW(dis->hDC, Str(label, g_lang), -1, &tr, flags);
+    SetTextColor(dis->hDC, oldColor);
+    SetBkMode(dis->hDC, oldMode);
+    if (oldFont) SelectObject(dis->hDC, oldFont);
+}
+
+// Alt+<letter> / <letter> inside a menu: owner-drawn items without a stored string are
+// resolved by the application. Returns true and the item index when a mnemonic matches.
+static bool FindMenuMnemonic(HMENU menu, wchar_t ch, int& index) {
+    if (!menu) return false;
+    const int count = GetMenuItemCount(menu);
+    for (int i = 0; i < count; ++i) {
+        MENUITEMINFOW mii = {};
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_DATA;
+        StrId label;
+        if (!GetMenuItemInfoW(menu, static_cast<UINT>(i), TRUE, &mii) ||
+            !MenuItemLabel(mii.dwItemData, label))
+            continue;
+        const wchar_t* text = Str(label, g_lang);
+        for (const wchar_t* c = text; *c; ++c) {
+            if (*c == L'&' && c[1] && c[1] != L'&') {
+                if (static_cast<wchar_t>(towlower(c[1])) == ch) {
+                    index = i;
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+// The area of the menu bar to the right of the last item is painted by the system in a
+// light colour. Fill just that strip (never the items) after the default non-client paint.
+static void PaintMenuBarStrip(HWND hwnd) {
+    if (!g_menuOwnerDraw || !g_darkTheme || !g_menuBar || GetMenu(hwnd) != g_menuBar) return;
+    const int count = GetMenuItemCount(g_menuBar);
+    if (count <= 0) return;
+
+    MENUBARINFO bar = {};
+    bar.cbSize = sizeof(bar);
+    MENUBARINFO last = {};
+    last.cbSize = sizeof(last);
+    if (!GetMenuBarInfo(hwnd, OBJID_MENU, 0, &bar) ||
+        !GetMenuBarInfo(hwnd, OBJID_MENU, count, &last))
+        return;
+    RECT window = {};
+    if (!GetWindowRect(hwnd, &window)) return;
+
+    RECT strip = {last.rcBar.right, bar.rcBar.top, bar.rcBar.right, bar.rcBar.bottom};
+    if (last.rcBar.top > bar.rcBar.top + SX(4)) return;       // wrapped onto several rows: leave it
+    if (strip.right <= strip.left || strip.bottom <= strip.top) return;
+    OffsetRect(&strip, -window.left, -window.top);            // screen -> window coordinates
+
+    if (HDC dc = GetWindowDC(hwnd)) {
+        FillSolid(dc, strip, ThemeWindowColor());
+        ReleaseDC(hwnd, dc);
+    }
+}
+
+// ========================================================================================
 // Window procedure
 // ========================================================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1200,6 +1530,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOG)), g_hInst, nullptr);
             if (g_log) SendMessageW(g_log, EM_SETLIMITTEXT, static_cast<WPARAM>(kLogLimitChars), 0);
 
+            for (HWND combo : {g_srcEmu, g_type, g_tgtEmu}) {
+                if (!combo) continue;
+                SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), SX(kComboItemHeight));
+                SendMessageW(combo, CB_SETITEMHEIGHT, 0, SX(kComboItemHeight));
+                SetWindowSubclass(combo, ComboSubclassProc, 2, 0);
+            }
+
             g_placeholder = MkStatic(hwnd, IDC_PLACEHOLDER, SS_CENTER, 0, 0, 10, 10);
 
             // Insert the three pages before ApplyLanguage sets localized captions.
@@ -1223,6 +1560,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             LoadLangIni();
             LoadThemeIni();
+            g_menuOwnerDraw = g_darkTheme;  // build the first menu in the right mode directly
             ApplyLanguage(g_lang, false);
             ApplyTheme(g_darkTheme, false);
             LayoutAll();
@@ -1302,9 +1640,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case WM_MEASUREITEM: {
+            MEASUREITEMSTRUCT* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+            if (mis && mis->CtlType == ODT_COMBOBOX) {
+                mis->itemHeight = static_cast<UINT>(SX(kComboItemHeight));
+                return TRUE;
+            }
+            if (mis && mis->CtlType == ODT_MENU && g_menuOwnerDraw) {
+                MeasureMenuItem(mis);
+                return TRUE;
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
+        case WM_MENUCHAR: {
+            int index = 0;
+            if (g_menuOwnerDraw &&
+                FindMenuMnemonic(reinterpret_cast<HMENU>(lParam),
+                                 static_cast<wchar_t>(towlower(LOWORD(wParam))), index))
+                return MAKELRESULT(index, MNC_EXECUTE);
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
+        case WM_NCPAINT:
+        case WM_NCACTIVATE: {
+            const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            PaintMenuBarStrip(hwnd);
+            return result;
+        }
+
         case WM_DRAWITEM: {
             const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
             if (!dis) return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+            if (dis->CtlType == ODT_COMBOBOX) {
+                DrawComboItem(dis);
+                return TRUE;
+            }
+            if (dis->CtlType == ODT_MENU && g_menuOwnerDraw) {
+                DrawMenuItemOwner(dis);
+                return TRUE;
+            }
 
             if (dis->hwndItem == g_tabs &&
                 dis->itemID < static_cast<UINT>(TabCtrl_GetItemCount(g_tabs))) {
