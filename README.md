@@ -1,4 +1,4 @@
-# Retro Save Converter
+# Retro Save Converter 1.0
 
 **A tiny bilingual (English / Русский) GUI utility that converts in-game battery saves — NOT save states — between NES emulators.**
 
@@ -141,7 +141,7 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-# Конвертер сохранений Retro
+# Конвертер сохранений Retro 1.0
 
 **Маленькая двуязычная (Русский / English) утилита с GUI, конвертирующая игровые сохранения (НЕ сейв-стейты) между эмуляторами NES.**
 
