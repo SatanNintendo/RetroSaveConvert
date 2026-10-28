@@ -200,16 +200,30 @@ inline const wchar_t* MsgTemplate(Msg m, Lang lang) {
     return kMsg[lang][static_cast<int>(m)];
 }
 
-// Expand %1..%3 in a template
+// Expand %1..%3 in a template.
+//
+// Single left-to-right pass over the TEMPLATE only: substituted text is never rescanned.
+// (The earlier replace-in-a-loop version looped forever -- and kept growing the string --
+// when a parameter such as a file name contained its own token, e.g. "Game%1.sav", and it
+// also let a "%2" inside one parameter be overwritten by the next parameter.)
+// A token whose parameter is missing is left in the output unchanged.
 inline std::wstring Expand(const std::wstring& tmpl, const std::vector<std::wstring>& params) {
-    std::wstring out = tmpl;
-    for (size_t i = 0; i < params.size() && i < 3; ++i) {
-        wchar_t tok[4] = L"%";
-        tok[1] = static_cast<wchar_t>(L'1' + i);
-        tok[2] = 0;
-        std::wstring::size_type pos;
-        while ((pos = out.find(tok)) != std::wstring::npos)
-            out.replace(pos, 2, params[i]);
+    std::wstring out;
+    out.reserve(tmpl.size() + 64);
+    for (size_t i = 0; i < tmpl.size(); ++i) {
+        const wchar_t c = tmpl[i];
+        if (c == L'%' && i + 1 < tmpl.size()) {
+            const wchar_t d = tmpl[i + 1];
+            if (d >= L'1' && d <= L'3') {
+                const size_t index = static_cast<size_t>(d - L'1');
+                if (index < params.size()) {
+                    out += params[index];
+                    ++i;  // consume the digit as well
+                    continue;
+                }
+            }
+        }
+        out += c;
     }
     return out;
 }

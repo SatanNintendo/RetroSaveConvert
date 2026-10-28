@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <exception>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -114,7 +115,7 @@ static HBRUSH ThemeEditBrush() {
     return g_brushEdit ? g_brushEdit : GetSysColorBrush(COLOR_WINDOW);
 }
 
-static int SX(int x) { return static_cast<int>(x * g_scale + 0.5f); }
+static int SX(int x) { return static_cast<int>(static_cast<float>(x) * g_scale + 0.5f); }
 
 static void DrawRoundedSurface(HDC dc, const RECT& rc, COLORREF fillColor,
                                COLORREF borderColor, int radius) {
@@ -140,7 +141,10 @@ static void DrawRoundedSurface(HDC dc, const RECT& rc, COLORREF fillColor,
 struct WinEnv : rsc::IEnv {
     bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) override {
         out.clear();
-        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        // Read-only access with every share mode allowed: an emulator that still has its
+        // save open must not make the converter fail with a sharing violation.
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) return false;
         bool ok = false;
@@ -221,6 +225,38 @@ struct WinEnv : rsc::IEnv {
         DWORD a = GetFileAttributesW(path.c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     }
+
+    // Reads at most maxBytes from the start of a file (used for the ROM: only the 16-byte
+    // iNES header matters, so a wrongly picked multi-hundred-MB file is never loaded).
+    // Returns false only if the file cannot be opened/read; a shorter file is not an error.
+    bool ReadFilePrefix(const std::wstring& path, size_t maxBytes, std::vector<uint8_t>& out) {
+        out.clear();
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        bool ok = true;
+        try {
+            out.resize(maxBytes);
+            size_t offset = 0;
+            while (offset < maxBytes) {
+                DWORD rd = 0;
+                if (!ReadFile(h, out.data() + offset, static_cast<DWORD>(maxBytes - offset),
+                              &rd, nullptr)) {
+                    ok = false;
+                    break;
+                }
+                if (rd == 0) break;  // end of file
+                offset += rd;
+            }
+            if (ok) out.resize(offset);
+        } catch (...) {
+            ok = false;
+        }
+        CloseHandle(h);
+        if (!ok) out.clear();
+        return ok;
+    }
 };
 
 // ========================================================================================
@@ -266,13 +302,43 @@ static std::wstring GetEditText(HWND edit) {
     size_t b = s.find_first_not_of(L" \t");
     size_t e = s.find_last_not_of(L" \t");
     if (b == std::wstring::npos) return std::wstring();
-    return s.substr(b, e - b + 1);
+    s = s.substr(b, e - b + 1);
+    // Explorer's "Copy as path" yields "C:\dir\file.sav" including the quotes. A double
+    // quote can never be part of a Windows file name, so peeling one pair is always safe.
+    if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"') {
+        s = s.substr(1, s.size() - 2);
+        b = s.find_first_not_of(L" \t");
+        e = s.find_last_not_of(L" \t");
+        if (b == std::wstring::npos) return std::wstring();
+        s = s.substr(b, e - b + 1);
+    }
+    return s;
 }
 
+// A plain EDIT control silently refuses further text once it reaches its default limit
+// (about 32 K characters), after which the log would simply stop updating. The limit is
+// therefore raised explicitly and the oldest lines are discarded once the log gets long,
+// so it never stalls and never grows without bound.
+static const int kLogLimitChars = 1000000;  // hard ceiling set on the control
+static const int kLogTrimAtChars = 100000;  // start discarding old lines beyond this
+
 static void LogLine(const std::wstring& line) {
+    if (!g_log) return;
+    const std::wstring nl = line + L"\r\n";
     int len = GetWindowTextLengthW(g_log);
-    SendMessageW(g_log, EM_SETSEL, len, len);
-    std::wstring nl = line + L"\r\n";
+    if (len + static_cast<int>(nl.size()) > kLogTrimAtChars) {
+        // Drop roughly the oldest half, cutting at a line boundary.
+        const LRESULT cutLine =
+            SendMessageW(g_log, EM_LINEFROMCHAR, static_cast<WPARAM>(len / 2), 0);
+        const LRESULT cutChar =
+            SendMessageW(g_log, EM_LINEINDEX, static_cast<WPARAM>(cutLine + 1), 0);
+        if (cutChar > 0) {
+            SendMessageW(g_log, EM_SETSEL, 0, static_cast<LPARAM>(cutChar));
+            SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+            len = GetWindowTextLengthW(g_log);
+        }
+    }
+    SendMessageW(g_log, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
     SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(nl.c_str()));
     SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
 }
@@ -811,7 +877,7 @@ static void TryAutoRom(const std::wstring& savePath) {
     if (slash != std::wstring::npos) saveName = saveName.substr(slash + 1);
     saveName = ToLowerW(saveName);
 
-    std::wstring guess;
+    std::wstring stem;  // candidate ROM path without extension
     if (saveName == L"save.ram" || saveName == L"save.eeprom" ||
         saveName == L"external.eeprom") {
         // ares' fixed save files live in <game>.pak; the ROM is normally next
@@ -821,14 +887,19 @@ static void TryAutoRom(const std::wstring& savePath) {
                (packageDir.back() == L'\\' || packageDir.back() == L'/'))
             packageDir.pop_back();
         if (GetExtOf(packageDir) == L".pak")
-            guess = GetDirOf(packageDir) + GetBaseNoExtOf(packageDir) + L".nes";
+            stem = GetDirOf(packageDir) + GetBaseNoExtOf(packageDir);
     }
-    if (guess.empty())
-        guess = GetDirOf(savePath) + GetBaseNoExtOf(savePath) + L".nes";
+    if (stem.empty())
+        stem = GetDirOf(savePath) + GetBaseNoExtOf(savePath);
 
-    if (env.FileExists(guess)) {
-        SetWindowTextW(g_romFile, guess.c_str());
-        LogLine(rsc::Expand(Str(S_DroppedRom, g_lang), {guess}));
+    // Same extensions as the ROM picker / drag & drop accept.
+    for (const wchar_t* romExt : {L".nes", L".unf"}) {
+        const std::wstring guess = stem + romExt;
+        if (env.FileExists(guess)) {
+            SetWindowTextW(g_romFile, guess.c_str());
+            LogLine(rsc::Expand(Str(S_DroppedRom, g_lang), {guess}));
+            break;
+        }
     }
 }
 
@@ -836,7 +907,7 @@ static void TryAutoRom(const std::wstring& savePath) {
 // ========================================================================================
 // Conversion
 // ========================================================================================
-static void OnConvert() {
+static void OnConvertImpl() {
     using namespace rsc;
 
     const std::wstring srcPath = GetEditText(g_srcFile);
@@ -858,7 +929,8 @@ static void OnConvert() {
     const std::wstring romPath = GetEditText(g_romFile);
     if (!romPath.empty()) {
         std::vector<uint8_t> romBytes;
-        if (!env.ReadFileBytes(romPath, romBytes)) {
+        // Only the 16-byte iNES / NES 2.0 header is needed.
+        if (!env.ReadFilePrefix(romPath, 16, romBytes)) {
             MessageBoxW(g_main, Expand(Str(S_ErrReadRom, g_lang), {romPath}).c_str(),
                         Str(S_AppTitle, g_lang), MB_OK | MB_ICONERROR);
             return;
@@ -919,22 +991,26 @@ static void OnConvert() {
                    : Str(S_Failed, g_lang));
 }
 
+// No C++ exception may escape into the Win32 message dispatcher (unwinding through system
+// frames terminates the process). The realistic trigger is std::bad_alloc on a gigantic
+// "save file"; report it as a normal failed conversion instead of crashing.
+static void OnConvert() {
+    try {
+        OnConvertImpl();
+    } catch (...) {
+        try {
+            LogLine(Str(S_Failed, g_lang));
+        } catch (...) {
+        }
+        MessageBoxW(g_main, Str(S_Failed, g_lang), Str(S_AppTitle, g_lang),
+                    MB_OK | MB_ICONERROR);
+    }
+}
+
 // ========================================================================================
 // Drag & drop
 // ========================================================================================
-static void OnDropFiles(HDROP hd) {
-    const UINT count = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
-    if (count == 0) {
-        DragFinish(hd);
-        return;
-    }
-
-    const UINT pathLength = DragQueryFileW(hd, 0, nullptr, 0);
-    std::wstring path(static_cast<size_t>(pathLength) + 1, L'\0');
-    const UINT copied = DragQueryFileW(hd, 0, &path[0], pathLength + 1);
-    DragFinish(hd);
-    if (copied == 0) return;
-    path.resize(copied);
+static void HandleDroppedPath(const std::wstring& path) {
     const std::wstring ext = GetExtOf(path);
     if (ext == L".nes" || ext == L".unf") {
         SetWindowTextW(g_romFile, path.c_str());
@@ -948,6 +1024,29 @@ static void OnDropFiles(HDROP hd) {
     } else {
         LogLine(rsc::Expand(Str(S_DroppedUnknown, g_lang), {path}));
     }
+}
+
+static void OnDropFiles(HDROP hd) {
+    // Collect every dropped path first and release the HDROP, then apply them in order, so a
+    // save and its ROM dropped together are both picked up (previously only the first was).
+    static const UINT kMaxDropped = 16;
+    std::vector<std::wstring> paths;
+    try {
+        const UINT count = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count && i < kMaxDropped; ++i) {
+            const UINT pathLength = DragQueryFileW(hd, i, nullptr, 0);
+            std::wstring path(static_cast<size_t>(pathLength) + 1, L'\0');
+            const UINT copied = DragQueryFileW(hd, i, &path[0], pathLength + 1);
+            if (copied == 0) continue;
+            path.resize(copied);
+            paths.push_back(std::move(path));
+        }
+    } catch (...) {
+        paths.clear();
+    }
+    DragFinish(hd);
+
+    for (const std::wstring& path : paths) HandleDroppedPath(path);
 }
 
 static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -1027,7 +1126,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             HDC dc = GetDC(hwnd);
             if (dc) {
                 const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
-                if (dpi > 0) g_scale = dpi / 96.0f;
+                if (dpi > 0) g_scale = static_cast<float>(dpi) / 96.0f;
                 ReleaseDC(hwnd, dc);
             }
             if (g_scale < 1.0f) g_scale = 1.0f;
@@ -1091,6 +1190,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                 0, 0, lx, lh, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOG)), g_hInst, nullptr);
+            if (g_log) SendMessageW(g_log, EM_SETLIMITTEXT, static_cast<WPARAM>(kLogLimitChars), 0);
 
             g_placeholder = MkStatic(hwnd, IDC_PLACEHOLDER, SS_CENTER, 0, 0, 10, 10);
 
@@ -1169,14 +1269,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_SIZE:
+            // A minimised window has an empty client area: laying out against it would only
+            // feed negative sizes to MoveWindow.
+            if (wParam == SIZE_MINIMIZED) return 0;
             // Layout first, then invalidate the child tree. Do not rely on a mouse
             // hover or a theme switch to trigger repainting of native combo/edit
             // controls after the parent has erased its background during live resize.
             LayoutAll();
-            if (wParam != SIZE_MINIMIZED) {
-                RedrawWindow(hwnd, nullptr, nullptr,
-                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
-            }
+            RedrawWindow(hwnd, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
             return 0;
 
         case WM_EXITSIZEMOVE:
@@ -1449,7 +1550,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     HDC desktopDc = GetDC(nullptr);
     if (desktopDc) {
         const int dpi = GetDeviceCaps(desktopDc, LOGPIXELSX);
-        if (dpi > 0) g_scale = dpi / 96.0f;
+        if (dpi > 0) g_scale = static_cast<float>(dpi) / 96.0f;
         ReleaseDC(nullptr, desktopDc);
     }
     if (g_scale < 1.0f) g_scale = 1.0f;

@@ -4,6 +4,7 @@
 #include "converter.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <utility>
 
 namespace rsc {
@@ -107,7 +108,8 @@ bool IsAres24C02Path(const std::wstring& path) {
 }
 
 bool Is24C02Path(const std::wstring& path) {
-    const std::wstring lower = ToLower(path);
+    // Only the file name counts: a folder called "x.eeprom256" must not influence the result.
+    const std::wstring lower = ToLower(GetName(path));
     return lower.find(L".eeprom256") != std::wstring::npos || IsAres24C02Path(path);
 }
 
@@ -378,6 +380,51 @@ ConvertResult Convert(const ConvertRequest& req, IEnv& env) {
     // ---- build the canonical payload --------------------------------------------------
     // Canonical Datach layout throughout this converter is [24C02 256 B | 24C01 128 B].
     std::vector<uint8_t> canonical;
+
+    // Datach from a single-chip source plus (when present) the complementary EEPROM file
+    // found beside it. Both chip buffers are always normalized to their exact chip size, so
+    // the result is guaranteed to be kSizeDatach bytes long.
+    auto mergeDatachParts = [&]() -> std::vector<uint8_t> {
+        std::vector<uint8_t> part24c02(kSize24C02, 0xFF);
+        std::vector<uint8_t> part24c01(kSize24C01, 0xFF);
+        if (size >= kSize24C02) {
+            part24c02.assign(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(kSize24C02));
+            if (size > kSize24C02)
+                AddIssue(res.issues, Severity::Warning, Msg::WarnTruncating,
+                         {Num(kSize24C02)});
+        } else {
+            // A source shorter than a 24C02 is treated as 24C01 data; padding/truncation to
+            // exactly 128 bytes is reported instead of silently producing a short buffer.
+            part24c01 = NormalizeChip(src, kSize24C01, res.issues);
+        }
+
+        bool merged = false;
+        if (siblingFound) {
+            std::vector<uint8_t> sib;
+            if (env.ReadFileBytes(siblingPath, sib)) {
+                if (Is24C02Path(siblingPath))
+                    part24c02 = NormalizeChip(sib, kSize24C02, res.issues);
+                else
+                    part24c01 = NormalizeChip(sib, kSize24C01, res.issues);
+                AddIssue(res.issues, Severity::Info, Msg::SiblingMerged,
+                         {GetName(siblingPath)});
+                merged = true;
+            }
+        }
+        if (!merged) {
+            // Name the file the user is actually expected to have (ares uses fixed names).
+            const std::wstring missing = !siblingPath.empty()
+                ? GetName(siblingPath)
+                : base + (size >= kSize24C02 ? L".eeprom128" : L".eeprom256");
+            AddIssue(res.issues, Severity::Warning, Msg::WarnNoSibling, {missing});
+        }
+
+        std::vector<uint8_t> both;
+        both.reserve(kSizeDatach);
+        both.insert(both.end(), part24c02.begin(), part24c02.end());
+        both.insert(both.end(), part24c01.begin(), part24c01.end());
+        return both;
+    };
     switch (type) {
         case SaveType::SRAM: {
             canonical = src;
@@ -457,30 +504,7 @@ ConvertResult Convert(const ConvertRequest& req, IEnv& env) {
                 } else if (size == kSizeDatach) {
                     canonical = src;
                 } else {
-                    std::vector<uint8_t> part24c02(kSize24C02, 0xFF);
-                    std::vector<uint8_t> part24c01(kSize24C01, 0xFF);
-                    if (size >= kSize24C02)
-                        part24c02.assign(src.begin(), src.begin() + kSize24C02);
-                    else
-                        part24c01.assign(src.begin(), src.end());
-                    if (siblingFound) {
-                        std::vector<uint8_t> sib;
-                        env.ReadFileBytes(siblingPath, sib);
-                        if (Is24C02Path(siblingPath))
-                            part24c02 = NormalizeChip(sib, kSize24C02, res.issues);
-                        else
-                            part24c01 = NormalizeChip(sib, kSize24C01, res.issues);
-                        AddIssue(res.issues, Severity::Info, Msg::SiblingMerged,
-                                 {GetName(siblingPath)});
-                    } else if (size >= kSize24C02) {
-                        AddIssue(res.issues, Severity::Warning, Msg::WarnNoSibling,
-                                 {base + L".eeprom128"});
-                    } else {
-                        AddIssue(res.issues, Severity::Warning, Msg::WarnNoSibling,
-                                 {base + L".eeprom256"});
-                    }
-                    canonical = part24c02;
-                    canonical.insert(canonical.end(), part24c01.begin(), part24c01.end());
+                    canonical = mergeDatachParts();
                 }
             } else if (srcFmt == Emu::FCEUX && size == kFceuxDatachSize) {
                 // Explicit FCEUX selection without a ROM header: this is the known
@@ -490,30 +514,7 @@ ConvertResult Convert(const ConvertRequest& req, IEnv& env) {
             } else if (size == kSizeDatach) {
                 canonical = src;  // Nestopia layout: [24C02 | 24C01]
             } else {
-                std::vector<uint8_t> part24c02(kSize24C02, 0xFF);
-                std::vector<uint8_t> part24c01(kSize24C01, 0xFF);
-                if (size >= kSize24C02)
-                    part24c02.assign(src.begin(), src.begin() + kSize24C02);
-                else
-                    part24c01.assign(src.begin(), src.end());
-                if (siblingFound) {
-                    std::vector<uint8_t> sib;
-                    env.ReadFileBytes(siblingPath, sib);
-                    if (Is24C02Path(siblingPath))
-                        part24c02 = NormalizeChip(sib, kSize24C02, res.issues);
-                    else
-                        part24c01 = NormalizeChip(sib, kSize24C01, res.issues);
-                    AddIssue(res.issues, Severity::Info, Msg::SiblingMerged,
-                             {GetName(siblingPath)});
-                } else if (size >= kSize24C02) {
-                    AddIssue(res.issues, Severity::Warning, Msg::WarnNoSibling,
-                             {base + L".eeprom128"});
-                } else {
-                    AddIssue(res.issues, Severity::Warning, Msg::WarnNoSibling,
-                             {base + L".eeprom256"});
-                }
-                canonical = part24c02;
-                canonical.insert(canonical.end(), part24c01.begin(), part24c01.end());
+                canonical = mergeDatachParts();
             }
             break;
         }
@@ -577,8 +578,12 @@ ConvertResult Convert(const ConvertRequest& req, IEnv& env) {
                         return res;
                     }
                     const size_t before = bytes.size();
-                    if (prefix > 0) bytes.resize(prefix, 0x00);
-                    bytes.resize(prefix + chrNvram, 0x00);
+                    // A ROM header that declares no NVRAM at all (non-battery iNES) gives no
+                    // target size: keep the data as-is rather than truncating it to 0 bytes.
+                    if (prefix + chrNvram > 0) {
+                        if (prefix > 0) bytes.resize(prefix, 0x00);
+                        bytes.resize(prefix + chrNvram, 0x00);
+                    }
                     if (bytes.size() != before)
                         AddIssue(res.issues, Severity::Info, Msg::Normalized,
                                  {Num(before), Num(bytes.size())});
@@ -633,6 +638,9 @@ ConvertResult Convert(const ConvertRequest& req, IEnv& env) {
                 AddIssue(res.issues, Severity::Error, Msg::ErrDatachUnsupported);
                 return res;
             }
+            // Every path above yields exactly kSizeDatach bytes; keep the split below safe
+            // even if a future branch forgets to.
+            if (canonical.size() != kSizeDatach) canonical.resize(kSizeDatach, 0xFF);
             const std::vector<uint8_t> p24c02(canonical.begin(), canonical.begin() + kSize24C02);
             const std::vector<uint8_t> p24c01(canonical.begin() + kSize24C02,
                                                canonical.begin() + kSizeDatach);
