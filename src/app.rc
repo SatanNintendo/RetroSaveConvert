@@ -13,8 +13,8 @@
 2 ICON "app.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    1,0,1,0
- PRODUCTVERSION 1,0,1,0
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
  FILEFLAGSMASK  0x3fL
 #ifdef _DEBUG
  FILEFLAGS      VS_FF_DEBUG
@@ -31,12 +31,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "SatanNintendo"
             VALUE "FileDescription",  "Retro Save Converter"
-            VALUE "FileVersion",      "1.0.1.0"
+            VALUE "FileVersion",      "1.0"
             VALUE "InternalName",     "RetroSaveConverter"
             VALUE "LegalCopyright",   "MIT License"
             VALUE "OriginalFilename", "RetroSaveConverter.exe"
             VALUE "ProductName",      "Retro Save Converter"
-            VALUE "ProductVersion",   "1.0.1.0"
+            VALUE "ProductVersion",   "1.0"
         END
     END
     BLOCK "VarFileInfo"

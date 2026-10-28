@@ -494,59 +494,67 @@ static void LayoutAll() {
     const int x0 = disp.left + SX(10);
     const int W  = disp.right - disp.left - SX(20);
 
-    const int lblW  = SX(132);
-    const int cx    = x0 + SX(140);
-    const int cw    = W - SX(140) - SX(96);
-    const int brw   = SX(88);
-    const int brx   = x0 + W - SX(88);
-    const int rowH  = SX(26);
-    const int rowP  = SX(32);
+    // Every control keeps the same inner margin (padX) from the panel edges, so nothing
+    // touches or overlaps the rounded panel border. The label column is wide enough for the
+    // longest caption ("ROM file (optional):") and leaves a gap before the input column.
+    const int padX   = SX(12);
+    const int lblW   = SX(160);
+    const int cx     = x0 + SX(182);            // left edge of the input column
+    const int rightX = x0 + W - padX;           // right edge of the input column
+    const int brw    = SX(88);
+    const int brx    = rightX - brw;            // "Browse" button
+    const int cw     = brx - SX(8) - cx;        // edit width (leaves a gap before Browse)
+    const int fullW  = rightX - cx;             // combo width
+    const int rowH   = SX(26);
+    const int rowP   = SX(34);
+    const int headH  = SX(30);                  // panel caption area
+    const int gap    = SX(8);                   // space between panels
 
     int y = disp.top + SX(8);
 
     // -- group: source ---------------------------------------------------------------
     const int srcRows = 4;
     const int comboH = SX(200);   // dropdown list height (closed height is font-based)
-    SetRect(&g_panelRc[0], x0, y, x0 + W, y + SX(24) + srcRows * rowP + SX(8));
-    y += SX(24);
-    MoveWindow(g_lblSrcEmu, x0 + SX(10), y, lblW, rowH, TRUE);
-    MoveWindow(g_srcEmu, cx, y - SX(3), cw + SX(96), comboH, TRUE);
+    SetRect(&g_panelRc[0], x0, y, x0 + W, y + headH + srcRows * rowP + SX(6));
+    y += headH;
+    MoveWindow(g_lblSrcEmu, x0 + padX, y, lblW, rowH, TRUE);
+    MoveWindow(g_srcEmu, cx, y - SX(3), fullW, comboH, TRUE);
     y += rowP;
-    MoveWindow(g_lblSave, x0 + SX(10), y, lblW, rowH, TRUE);
+    MoveWindow(g_lblSave, x0 + padX, y, lblW, rowH, TRUE);
     MoveWindow(g_srcFile, cx, y - SX(2), cw, rowH + SX(2), TRUE);
     MoveWindow(g_btnSrcBrowse, brx, y - SX(2), brw, rowH + SX(2), TRUE);
     y += rowP;
-    MoveWindow(g_lblRom, x0 + SX(10), y, lblW, rowH, TRUE);
+    MoveWindow(g_lblRom, x0 + padX, y, lblW, rowH, TRUE);
     MoveWindow(g_romFile, cx, y - SX(2), cw, rowH + SX(2), TRUE);
     MoveWindow(g_btnRomBrowse, brx, y - SX(2), brw, rowH + SX(2), TRUE);
     y += rowP;
-    MoveWindow(g_lblType, x0 + SX(10), y, lblW, rowH, TRUE);
-    MoveWindow(g_type, cx, y - SX(3), cw + SX(96), comboH, TRUE);
-    y += rowP + SX(12);
+    MoveWindow(g_lblType, x0 + padX, y, lblW, rowH, TRUE);
+    MoveWindow(g_type, cx, y - SX(3), fullW, comboH, TRUE);
+    y += rowP + SX(6) + gap;                    // bottom of the panel + gap
 
     // -- group: target ---------------------------------------------------------------
     SetRect(&g_panelRc[1], x0, y, x0 + W,
-            y + SX(24) + 2 * rowP + SX(2) + SX(14) + SX(10));
-    y += SX(24);
-    MoveWindow(g_lblTgt, x0 + SX(10), y, lblW, rowH, TRUE);
-    MoveWindow(g_tgtEmu, cx, y - SX(3), cw + SX(96), comboH, TRUE);
+            y + headH + 2 * rowP + SX(2) + SX(14) + SX(10));
+    y += headH;
+    MoveWindow(g_lblTgt, x0 + padX, y, lblW, rowH, TRUE);
+    MoveWindow(g_tgtEmu, cx, y - SX(3), fullW, comboH, TRUE);
     y += rowP;
-    MoveWindow(g_lblOutDir, x0 + SX(10), y, lblW, rowH, TRUE);
+    MoveWindow(g_lblOutDir, x0 + padX, y, lblW, rowH, TRUE);
     MoveWindow(g_outDir, cx, y - SX(2), cw, rowH + SX(2), TRUE);
     MoveWindow(g_btnOutDirBrowse, brx, y - SX(2), brw, rowH + SX(2), TRUE);
     y += rowP + SX(2);
-    MoveWindow(g_lblOutDirHint, cx, y, W - SX(140), SX(14), TRUE);
-    y += SX(16) + SX(10);
+    MoveWindow(g_lblOutDirHint, cx, y, fullW, SX(14), TRUE);
+    y += SX(14) + SX(10) + gap;
 
     // -- group: options --------------------------------------------------------------
-    SetRect(&g_panelRc[2], x0, y, x0 + W, y + SX(24) + rowP + SX(6));
-    y += SX(24);
-    MoveWindow(g_backup, x0 + SX(10), y, W - SX(20), rowH + SX(2), TRUE);
-    y += rowP + SX(6);
+    SetRect(&g_panelRc[2], x0, y, x0 + W, y + headH + rowH + SX(2) + SX(10));
+    y += headH;
+    MoveWindow(g_backup, x0 + padX, y, W - 2 * padX, rowH + SX(2), TRUE);
+    y += rowH + SX(2) + SX(10) + SX(12);
 
     // -- convert + log ---------------------------------------------------------------
     MoveWindow(g_convert, cx, y, SX(150), rowH + SX(8), TRUE);
-    y += rowP + SX(12);
+    y += rowH + SX(8) + SX(12);
     MoveWindow(g_lblLog, x0, y, W, SX(16), TRUE);
     y += SX(20);
     const int logH = disp.bottom - y;
@@ -1290,7 +1298,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
             mmi->ptMinTrackSize.x = SX(560);
-            mmi->ptMinTrackSize.y = SX(560);
+            mmi->ptMinTrackSize.y = SX(610);
             return 0;
         }
 
@@ -1555,7 +1563,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
     if (g_scale < 1.0f) g_scale = 1.0f;
 
-    const int W = SX(560), H = SX(590);
+    const int W = SX(560), H = SX(640);
     RECT adj = {0, 0, W, H};
     AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
 
@@ -1564,7 +1572,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     // the parent background showing through.
     const DWORD mainStyle =
         (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
-    g_main = CreateWindowExW(0, L"RetroSaveConverterWnd", L"Retro Save Converter",
+    g_main = CreateWindowExW(0, L"RetroSaveConverterWnd", L"Retro Save Converter " RSC_VERSION,
                              mainStyle, CW_USEDEFAULT, CW_USEDEFAULT,
                              adj.right - adj.left, adj.bottom - adj.top,
                              nullptr, nullptr, hInstance, nullptr);

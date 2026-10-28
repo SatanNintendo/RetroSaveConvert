@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+// Single source of truth for the version shown in the title bar and the About box.
+// (app.rc carries the same number for the EXE's file properties: keep them in sync.)
+#define RSC_VERSION L"1.0"
+
 namespace rsc {
 
 enum Lang { LANG_EN = 0, LANG_RU = 1 };
@@ -41,7 +45,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
     static const wchar_t* const kTable[2][S_COUNT] = {
         // ------------------------------------------------------------------ English
         {
-            L"Retro Save Converter",
+            L"Retro Save Converter " RSC_VERSION,
             L"NES / FC", L"SNES / SFC", L"N64",
             L"Source save", L"Target format", L"Options",
             L"Source emulator:", L"Save file:", L"Browse...", L"ROM file (optional):",
@@ -79,7 +83,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"ROM file set: %1",
             L"Unsupported file type: %1",
             L"INFO", L"WARNING", L"ERROR",
-            L"Retro Save Converter 1.0\n\n"
+            L"Retro Save Converter " RSC_VERSION L"\n\n"
             L"Converts in-game battery saves (NOT save states) between NES emulators:\n"
             L"MesenCE, Nestopia, Nintendulator, FCEUX, puNES and ares (NES).\n\n"
             L"Based on the save-format research of each emulator's source code.\n"
@@ -87,7 +91,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
         },
         // ------------------------------------------------------------------ Русский
         {
-            L"Конвертер сохранений Retro",
+            L"Конвертер сохранений Retro " RSC_VERSION,
             L"NES / FC", L"SNES / SFC", L"N64",
             L"Исходное сохранение", L"Целевой формат", L"Параметры",
             L"Эмулятор-источник:", L"Файл сохранения:", L"Обзор...", L"Файл ROM (необязательно):",
@@ -125,7 +129,7 @@ inline const wchar_t* Str(StrId id, Lang lang) {
             L"Файл ROM выбран: %1",
             L"Неподдерживаемый тип файла: %1",
             L"ИНФО", L"ВНИМАНИЕ", L"ОШИБКА",
-            L"Конвертер сохранений Retro 1.0\n\n"
+            L"Конвертер сохранений Retro " RSC_VERSION L"\n\n"
             L"Конвертирует игровые сохранения (НЕ сейв-стейты) между эмуляторами NES:\n"
             L"MesenCE, Nestopia, Nintendulator, FCEUX, puNES и ares (NES).\n\n"
             L"Форматы сохранений изучены по исходному коду каждого эмулятора.\n"
