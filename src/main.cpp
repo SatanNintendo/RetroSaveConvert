@@ -73,6 +73,12 @@ static HWND g_lblType,   g_type;
 static HWND g_lblTgt,    g_tgtEmu;
 static HWND g_lblOutDir, g_outDir, g_btnOutDirBrowse, g_lblOutDirHint;
 static HWND g_backup, g_convert, g_lblLog, g_log;
+// The log uses our own slim scroll bar (native scroll bars cannot be recoloured on Windows 7).
+// If its window class cannot be registered, the log falls back to the native scroll bar.
+static HWND g_logScroll = nullptr;
+static bool g_customLogScroll = false;
+static void SyncLogScroll();
+static const UINT_PTR kLogScrollTimer = 1;
 
 static rsc::Lang g_lang = rsc::LANG_EN;
 static bool      g_darkTheme = false;
@@ -346,6 +352,7 @@ static void LogLine(const std::wstring& line) {
     SendMessageW(g_log, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
     SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(nl.c_str()));
     SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
+    SyncLogScroll();
 }
 
 static void LogIssue(const rsc::Issue& issue) {
@@ -564,7 +571,14 @@ static void LayoutAll() {
     MoveWindow(g_lblLog, x0, y, W, SX(16), TRUE);
     y += SX(20);
     const int logH = disp.bottom - y;
-    MoveWindow(g_log, x0, y, W, (logH > SX(60)) ? logH : SX(60), TRUE);
+    const int logHeight = (logH > SX(60)) ? logH : SX(60);
+    if (g_logScroll) {
+        const int sbW = SX(14);
+        MoveWindow(g_log, x0, y, W - sbW, logHeight, TRUE);
+        MoveWindow(g_logScroll, x0 + W - sbW, y, sbW, logHeight, TRUE);
+    } else {
+        MoveWindow(g_log, x0, y, W, logHeight, TRUE);
+    }
 
     // placeholder label for SNES/N64 tabs (centered)
     MoveWindow(g_placeholder, disp.left + SX(10), disp.top + SX(40),
@@ -845,6 +859,7 @@ static void ApplyTheme(bool dark, bool saveIni) {
                                IDM_LANG_EN + static_cast<int>(g_lang), MF_BYCOMMAND);
         if (g_main) DrawMenuBar(g_main);
     }
+    if (g_logScroll) InvalidateRect(g_logScroll, nullptr, TRUE);
     if (saveIni) SaveThemeIni();
     if (g_main) RefreshWindowPainting(g_main);
 }
@@ -1449,6 +1464,195 @@ static void PaintMenuBarStrip(HWND hwnd) {
 // ========================================================================================
 // Window procedure
 // ========================================================================================
+// ========================================================================================
+// Slim log scroll bar. The EDIT control keeps all scrolling logic; this window only shows
+// its position (EM_GETFIRSTVISIBLELINE / EM_GETLINECOUNT) and asks it to scroll
+// (EM_LINESCROLL), so selection, keyboard and wheel behaviour stay the control's own.
+// ========================================================================================
+static const wchar_t kLogScrollClass[] = L"RscLogScroll";
+
+struct LogScrollState {
+    int first = 0;    // first visible line
+    int total = 0;    // total (wrapped) lines
+    int visible = 1;  // lines currently shown
+};
+
+static bool GetLogScrollState(LogScrollState& st) {
+    if (!g_log) return false;
+    RECT rc = {};
+    if (!GetClientRect(g_log, &rc)) return false;
+    st.total = static_cast<int>(SendMessageW(g_log, EM_GETLINECOUNT, 0, 0));
+    st.first = static_cast<int>(SendMessageW(g_log, EM_GETFIRSTVISIBLELINE, 0, 0));
+    const LRESULT pos = SendMessageW(g_log, EM_CHARFROMPOS, 0,
+                                     MAKELPARAM(2, (std::max)(0, static_cast<int>(rc.bottom) - 1)));
+    const int lastLine = static_cast<int>(HIWORD(pos));  // line index of the bottom-most row
+    st.visible = (std::max)(1, lastLine - st.first + 1);
+    if (st.total < 1) st.total = 1;
+    return true;
+}
+
+// Scrolls the log by 'lines', never past the first/last page.
+static void ScrollLogBy(int lines) {
+    LogScrollState st;
+    if (!GetLogScrollState(st)) return;
+    const int maxFirst = (std::max)(0, st.total - st.visible);
+    const int target = (std::min)((std::max)(st.first + lines, 0), maxFirst);
+    if (target != st.first)
+        SendMessageW(g_log, EM_LINESCROLL, 0, static_cast<LPARAM>(target - st.first));
+    SyncLogScroll();
+}
+
+static bool g_sbDragging = false, g_sbHot = false;
+static int g_sbGrab = 0;
+
+// Thumb rectangle in the scroll bar's client coordinates; false when everything fits.
+static bool LogScrollThumb(HWND sb, const LogScrollState& st, RECT& thumb, int& trackH, int& thumbH) {
+    RECT rc = {};
+    GetClientRect(sb, &rc);
+    trackH = rc.bottom - rc.top;
+    if (trackH <= 0 || st.total <= st.visible) return false;
+    thumbH = (std::max)(SX(24), static_cast<int>(static_cast<long long>(trackH) * st.visible / st.total));
+    if (thumbH > trackH) thumbH = trackH;
+    const int range = st.total - st.visible;
+    const int first = (std::min)((std::max)(st.first, 0), range);
+    const int top = (trackH - thumbH) * first / range;
+    thumb.left = rc.left + SX(3);
+    thumb.right = rc.right - SX(3);
+    thumb.top = top;
+    thumb.bottom = top + thumbH;
+    return true;
+}
+
+static void PaintLogScroll(HWND sb, HDC dc) {
+    RECT rc = {};
+    GetClientRect(sb, &rc);
+    FillSolid(dc, rc, ThemeEditColor());
+
+    LogScrollState st;
+    RECT thumb = {};
+    int trackH = 0, thumbH = 0;
+    if (GetLogScrollState(st) && LogScrollThumb(sb, st, thumb, trackH, thumbH)) {
+        COLORREF c = ThemeBorderColor();
+        if (g_sbDragging)
+            c = ThemeAccentColor();
+        else if (g_sbHot)
+            c = g_darkTheme ? RGB(92, 100, 113) : RGB(176, 184, 196);
+        else if (!g_darkTheme)
+            c = RGB(203, 210, 220);
+        DrawRoundedSurface(dc, thumb, c, c, 6);
+    }
+    // thin frame on the sides the EDIT's own border does not cover
+    if (HBRUSH frame = CreateSolidBrush(ThemeBorderColor())) {
+        RECT top = {rc.left, rc.top, rc.right, rc.top + 1};
+        RECT bottom = {rc.left, rc.bottom - 1, rc.right, rc.bottom};
+        RECT right = {rc.right - 1, rc.top, rc.right, rc.bottom};
+        FillRect(dc, &top, frame);
+        FillRect(dc, &bottom, frame);
+        FillRect(dc, &right, frame);
+        DeleteObject(frame);
+    }
+}
+
+static void SyncLogScroll() {
+    static int cFirst = -1, cTotal = -1, cVisible = -1;
+    if (!g_logScroll) return;
+    LogScrollState st;
+    if (!GetLogScrollState(st)) return;
+    if (st.first != cFirst || st.total != cTotal || st.visible != cVisible) {
+        cFirst = st.first; cTotal = st.total; cVisible = st.visible;
+        InvalidateRect(g_logScroll, nullptr, FALSE);
+    }
+}
+
+static LRESULT CALLBACK LogScrollProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (dc) PaintLogScroll(hwnd, dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            LogScrollState st;
+            RECT thumb = {};
+            int trackH = 0, thumbH = 0;
+            if (!GetLogScrollState(st) || !LogScrollThumb(hwnd, st, thumb, trackH, thumbH))
+                return 0;
+            const int y = static_cast<short>(HIWORD(lParam));
+            if (y >= thumb.top && y < thumb.bottom) {
+                g_sbDragging = true;
+                g_sbGrab = y - thumb.top;
+                SetCapture(hwnd);
+            } else {
+                const int page = (std::max)(1, st.visible - 1);
+                ScrollLogBy(y < thumb.top ? -page : page);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (!g_sbHot) {
+                g_sbHot = true;
+                TRACKMOUSEEVENT tme = {};
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (g_sbDragging) {
+                LogScrollState st;
+                RECT thumb = {};
+                int trackH = 0, thumbH = 0;
+                if (GetLogScrollState(st) && LogScrollThumb(hwnd, st, thumb, trackH, thumbH) &&
+                    trackH > thumbH) {
+                    const int y = static_cast<short>(HIWORD(lParam));
+                    const int pos = (std::min)((std::max)(y - g_sbGrab, 0), trackH - thumbH);
+                    const int range = st.total - st.visible;
+                    const int target = (pos * range + (trackH - thumbH) / 2) / (trackH - thumbH);
+                    ScrollLogBy(target - st.first);
+                }
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            g_sbHot = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONUP:
+            if (g_sbDragging && GetCapture() == hwnd) ReleaseCapture();
+            g_sbDragging = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_CAPTURECHANGED:
+            g_sbDragging = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (g_log) SendMessageW(g_log, WM_MOUSEWHEEL, wParam, lParam);
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+// Without WS_VSCROLL the EDIT no longer reacts to the wheel on its own.
+static LRESULT CALLBACK LogEditSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR, DWORD_PTR) {
+    if (msg == WM_MOUSEWHEEL) {
+        static int accumulated = 0;
+        accumulated += static_cast<short>(HIWORD(wParam));
+        const int notches = accumulated / WHEEL_DELTA;
+        accumulated -= notches * WHEEL_DELTA;
+        if (notches != 0) ScrollLogBy(-notches * 3);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_NCCREATE:
@@ -1524,11 +1728,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_lblLog   = MkStatic(hwnd, IDC_LBL_LOG, 0, 0, 0, lx, SX(16));
             g_log      = CreateWindowExW(
                 0, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WS_BORDER | WS_VSCROLL |
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WS_BORDER |
+                    (g_customLogScroll ? 0 : WS_VSCROLL) |
                     ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                 0, 0, lx, lh, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOG)), g_hInst, nullptr);
             if (g_log) SendMessageW(g_log, EM_SETLIMITTEXT, static_cast<WPARAM>(kLogLimitChars), 0);
+            if (g_log && g_customLogScroll) {
+                g_logScroll = CreateWindowExW(0, kLogScrollClass, L"", WS_CHILD | WS_VISIBLE |
+                                                  WS_CLIPSIBLINGS,
+                                              0, 0, SX(14), lh, hwnd, nullptr, g_hInst, nullptr);
+                if (g_logScroll) {
+                    SetWindowSubclass(g_log, LogEditSubclass, 3, 0);
+                    SetTimer(hwnd, kLogScrollTimer, 120, nullptr);  // follows scrolling done by the edit
+                } else {
+                    // could not create it: give the edit its native scroll bar back
+                    SetWindowLongPtrW(g_log, GWL_STYLE,
+                                      GetWindowLongPtrW(g_log, GWL_STYLE) | WS_VSCROLL);
+                    SetWindowPos(g_log, nullptr, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                }
+            }
 
             for (HWND combo : {g_srcEmu, g_type, g_tgtEmu}) {
                 if (!combo) continue;
@@ -1858,7 +2078,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return DefWindowProcW(hwnd, msg, wParam, lParam);
         }
 
+        case WM_TIMER:
+            if (wParam == kLogScrollTimer) {
+                SyncLogScroll();
+                return 0;
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+
         case WM_DESTROY:
+            KillTimer(hwnd, kLogScrollTimer);
             PostQuitMessage(0);
             return 0;
 
@@ -1928,6 +2156,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         return 1;
     }
 
+    {   // slim log scroll bar; optional -- the log falls back to the native one if this fails
+        WNDCLASSEXW sc;
+        ZeroMemory(&sc, sizeof(sc));
+        sc.cbSize = sizeof(sc);
+        sc.lpfnWndProc = LogScrollProc;
+        sc.hInstance = hInstance;
+        sc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        sc.lpszClassName = kLogScrollClass;
+        g_customLogScroll = RegisterClassExW(&sc) != 0;
+    }
+
     // Establish scale before calculating the initial outer window size. With
     // DPI awareness enabled in the manifest, initializing it only in WM_CREATE
     // makes the first window too small on high-DPI displays.
@@ -1953,6 +2192,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
                              adj.right - adj.left, adj.bottom - adj.top,
                              nullptr, nullptr, hInstance, nullptr);
     if (!g_main) {
+        if (g_customLogScroll) UnregisterClassW(kLogScrollClass, hInstance);
         UnregisterClassW(wc.lpszClassName, hInstance);
         if (wc.hIconSm) DestroyIcon(wc.hIconSm);
         if (oleReady) OleUninitialize();
@@ -1987,6 +2227,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     const int exitCode = (messageResult == -1) ? 1 : static_cast<int>(msg.wParam);
+    if (g_customLogScroll) UnregisterClassW(kLogScrollClass, hInstance);
     UnregisterClassW(wc.lpszClassName, hInstance);
     if (wc.hIconSm) DestroyIcon(wc.hIconSm);
     if (oleReady) OleUninitialize();
