@@ -695,6 +695,103 @@ static void TestStringsTables() {
     CHECK_EQ(static_cast<int>(rsc::Msg::ErrPunesNvramTooSmall), 22);
 }
 
+static void TestRegressions() {
+    std::printf("[test] regressions: Expand() re-scan, undersized Datach source, folder names\n");
+
+    // --- Expand(): a parameter containing its own token must not loop or be re-expanded ---
+    CHECK(Expand(L"Could not read: %1", {L"C:\\s\\Game%1.sav"}) ==
+          L"Could not read: C:\\s\\Game%1.sav");
+    CHECK(Expand(L"Written: %1 (%2 bytes)", {L"A%2.sav", L"384"}) ==
+          L"Written: A%2.sav (384 bytes)");
+    CHECK(Expand(L"x %1 %2", {}) == L"x %1 %2");          // missing params stay literal
+    CHECK(Expand(L"100% %", {L"a"}) == L"100% %");        // stray percent signs
+    CHECK(Expand(L"%1%2%3", {L"a", L"b", L"c"}) == L"abc");
+
+    // --- Datach built from a source shorter than a chip: always exactly 256 + 128 bytes ---
+    const size_t shortSizes[] = {16, 100, 127, 128, 129, 200, 255};
+    for (size_t n : shortSizes) {
+        RamEnv env;
+        ConvertRequest q = BasicReq(L"C:/s/Datach.sav", std::vector<uint8_t>(n, 0xAB));
+        q.sourceFormat = Emu::Raw;
+        q.saveType = SaveType::EepromDatach;
+        q.target = Emu::MesenCE;
+        ConvertResult r = Convert(q, env);
+        CHECK(r.ok);
+        CHECK_EQ(r.outputs.size(), 2u);
+        if (r.outputs.size() == 2) {
+            CHECK_EQ(r.outputs[0].bytes.size(), 256u);   // 24C02 (absent -> 0xFF)
+            CHECK_EQ(r.outputs[1].bytes.size(), 128u);   // 24C01
+            CHECK(std::all_of(r.outputs[0].bytes.begin(), r.outputs[0].bytes.end(),
+                              [](uint8_t b) { return b == 0xFF; }));
+            const size_t keep = std::min<size_t>(n, 128);
+            for (size_t i = 0; i < 128; ++i)
+                CHECK_EQ(r.outputs[1].bytes[i], i < keep ? 0xAB : 0xFF);  // padded, never garbage
+        }
+        CHECK_EQ(HasMsg(r, Msg::WarnPadding), n < 128);
+        CHECK_EQ(HasMsg(r, Msg::WarnTruncating), n > 128);
+    }
+
+    // --- oversized source forced to Datach: first 256 bytes are used and it is reported ---
+    {
+        RamEnv env;
+        ConvertRequest q = BasicReq(L"C:/s/Big.sav", MakeBytes(300, 0x21));
+        q.sourceFormat = Emu::Raw;
+        q.saveType = SaveType::EepromDatach;
+        q.target = Emu::Nestopia;
+        ConvertResult r = Convert(q, env);
+        CHECK(r.ok);
+        CHECK_EQ(r.outputs.size(), 1u);
+        CHECK(HasMsg(r, Msg::WarnTruncating));
+        if (r.outputs.size() == 1) CHECK_EQ(r.outputs[0].bytes.size(), 384u);
+    }
+
+    // --- ares: the missing-sibling warning names the real ares file ---
+    {
+        RamEnv env;
+        ConvertRequest q = BasicReq(L"C:/ares/G.pak/save.eeprom", MakeBytes(256, 0x05));
+        q.sourceFormat = Emu::Ares;
+        q.saveType = SaveType::EepromDatach;
+        q.target = Emu::MesenCE;
+        ConvertResult r = Convert(q, env);
+        bool named = false;
+        for (const auto& i : r.issues)
+            if (i.code == Msg::WarnNoSibling && !i.params.empty() &&
+                i.params[0] == L"external.eeprom") named = true;
+        CHECK(named);
+    }
+
+    // --- a folder named like an EEPROM file must not change how the sibling is classified ---
+    {
+        RamEnv env;
+        env.files[L"C:/x.eeprom256/G.eeprom128"] = std::vector<uint8_t>(128, 0x44);
+        ConvertRequest q = BasicReq(L"C:/x.eeprom256/G.eeprom256", MakeBytes(256, 0x09));
+        q.sourceFormat = Emu::MesenCE;
+        q.target = Emu::Nestopia;
+        ConvertResult r = Convert(q, env);
+        CHECK(r.ok);
+        CHECK_EQ(r.outputs.size(), 1u);
+        if (r.outputs.size() == 1) {
+            CHECK_EQ(r.outputs[0].bytes.size(), 384u);
+            CHECK_EQ(r.outputs[0].bytes[0], MakeBytes(256, 0x09)[0]);  // 24C02 first
+            CHECK_EQ(r.outputs[0].bytes[256], 0x44);                   // then 24C01
+        }
+    }
+
+    // --- puNES target + ROM without battery: the save must never be truncated to 0 bytes ---
+    {
+        RamEnv env;
+        std::vector<uint8_t> nes = MakeNes(1, false);
+        ConvertRequest q = BasicReq(L"C:/s/NoBat.sav", MakeBytes(2048, 0x31));
+        q.sourceFormat = Emu::Raw;
+        q.rom = ParseNesHeader(nes.data(), nes.size());
+        q.target = Emu::PuNES;
+        ConvertResult r = Convert(q, env);
+        CHECK(r.ok);
+        CHECK_EQ(r.outputs.size(), 1u);
+        if (r.outputs.size() == 1) CHECK(r.outputs[0].bytes == MakeBytes(2048, 0x31));
+    }
+}
+
 int main() {
     TestStringsTables();
     TestHeaderParsing();
@@ -706,6 +803,7 @@ int main() {
     TestDetectionAndErrors();
     TestWriteOutputs();
     TestNewEmulators();
+    TestRegressions();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
